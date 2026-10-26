@@ -14,8 +14,8 @@
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "npm run compile && npm run i18n:check && npx @vscode/vsce package --skip-license -o custom-for-copilot-chat.vsix",
-        "publishCmd": "npx @vscode/vsce publish --azure-credential --skip-license --packagePath custom-for-copilot-chat.vsix"
+        "prepareCmd": "npm run compile && npm run i18n:check && npx @vscode/vsce package --skip-license -o custom-for-copilot.vsix",
+        "publishCmd": "npx @vscode/vsce publish --azure-credential --skip-license --packagePath custom-for-copilot.vsix"
       }
     ],
     [

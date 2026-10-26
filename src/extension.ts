@@ -1,5 +1,5 @@
 /**
- * Custom for Copilot Chat — main entry point.
+ * Custom for Copilot — main entry point.
  *
  * Registers a first-class `LanguageModelChatProvider` (vendor `custommodel`)
  * backed by any OpenAI-compatible endpoint the user configures (API base URL +
@@ -45,6 +45,7 @@ import {
 import { registerModelListMirror } from './modelListSetting';
 import { registerModelStatusBar } from './statusBar';
 import { clearCapabilities, initCapabilityStore, rememberedCount } from './modelCapability';
+import { syncToCopilot } from './harnessSync';
 
 const LOG_TAG = '[custom-for-copilot-chat]';
 
@@ -129,6 +130,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('customModel.configureAgentWindowTools', () =>
       showAgentWindowToolsMenu()
     )
+  );
+
+  // Re-announce the catalog and repair what the HOST remembers: stale picker
+  // ids in `chat.*` slots, allow-list keys from a previous id of this
+  // extension, and per-model settings for groups that no longer exist. The
+  // provider is a live query, so this is only needed when the host kept a
+  // stale view — see harnessSync.ts for what each pass does and why the last
+  // one writes a host-owned file.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('customModel.syncToCopilot', () => syncToCopilot(context))
   );
 
   // The learned-capability cache has NO expiry: it is what a gateway answered

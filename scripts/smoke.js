@@ -14,6 +14,11 @@ class LanguageModelToolCallPart {
 class LanguageModelDataPart {
   constructor(data, mimeType) { this.data = data; this.mimeType = mimeType; }
 }
+// Proposed API, resolved at runtime by out/thinking.js. Keeps `id` because the
+// chat model groups reasoning deltas by it — asserted at the end of the run.
+class LanguageModelThinkingPart {
+  constructor(value, id) { this.value = value; this.id = id; }
+}
 class LanguageModelToolResultPart {
   constructor(callId, content) { this.callId = callId; this.content = content; }
 }
@@ -43,6 +48,7 @@ const vscodeStub = {
   LanguageModelTextPart,
   LanguageModelToolCallPart,
   LanguageModelDataPart,
+  LanguageModelThinkingPart,
   LanguageModelToolResultPart,
   LanguageModelChatToolMode: { Auto: 0, Required: 1 },
   ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
@@ -85,12 +91,12 @@ require.cache['vscode-stub'] = { id: 'vscode-stub', filename: 'vscode-stub', loa
 const assert = require('assert');
 const { convertMessage, dropRejectedParams, estimatePromptTokens, buildRequestBody, readThinkingEffortChoice, readModelLimitOverrides, applyLimitOverrides, applyCompatibilityFallback, bodyDigest } = require('../out/message.js');
 const {
+  THINKING_EFFORTS,
+  DEFAULT_THINKING_EFFORT,
   resolveThinkingEffort,
+  thinkingEffortParam,
   detectModelPreset,
   resolveProfileEntry,
-  CONTEXT_WINDOW_TIERS,
-  contextTierOptions,
-  defaultContextTier,
   realInputCeiling,
   summaryInputTokens,
   summaryWindowLabel,
@@ -245,23 +251,30 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
   assert.strictEqual(estimatePromptTokens(messages) > 0, true);
   // --- thinking effort: gear resolution + what lands on the wire ---
   const entry = { id: 'm1', name: 'm1', maxInputTokens: 128000, maxOutputTokens: 16384 };
+  // The four positions ARE the words the Copilot harness can label (its own
+  // table: none / minimal / low / medium / high / xhigh / max). A value outside
+  // it is DROPPED there, which is how this extension used to show five
+  // positions in one window and four in the other.
+  assert.deepStrictEqual([...THINKING_EFFORTS], ['none', 'low', 'medium', 'high']);
+  assert.strictEqual(DEFAULT_THINKING_EFFORT, 'high', 'the highest effort is the default');
   assert.strictEqual(resolveThinkingEffort('high'), 'high');
   assert.strictEqual(resolveThinkingEffort('HIGH'), 'high', 'case-insensitive');
-  assert.strictEqual(resolveThinkingEffort('nonsense'), 'auto', 'unknown id → the safe default');
-  assert.strictEqual(resolveThinkingEffort(undefined), 'auto', 'older host → the safe default');
+  assert.strictEqual(resolveThinkingEffort('nonsense'), 'high', 'unknown id → the default');
+  assert.strictEqual(resolveThinkingEffort(undefined), 'high', 'older host → the default');
+  assert.strictEqual(resolveThinkingEffort('auto'), 'none', 'retired id keeps meaning "send nothing"');
   assert.strictEqual(readThinkingEffortChoice({ modelOptions: { reasoningEffort: 'low' } }), 'low');
   assert.strictEqual(readThinkingEffortChoice({ modelConfiguration: { reasoningEffort: 'medium' } }), 'medium');
   assert.strictEqual(readThinkingEffortChoice({}), undefined);
 
   const noopOptions = { toolMode: undefined, tools: undefined };
-  const bodyAuto = buildRequestBody(entry, 'auto', [{ role: 1, content: [new LanguageModelTextPart('hi')] }], noopOptions, 'main-agent', []);
-  assert.strictEqual(bodyAuto.model, 'm1');
-  assert.ok(!('reasoning_effort' in bodyAuto), 'auto sends no reasoning parameter at all');
-  assert.ok(!('max_tokens' in bodyAuto), 'the main agent never clamps output');
+  const bodyNone = buildRequestBody(entry, 'none', [{ role: 1, content: [new LanguageModelTextPart('hi')] }], noopOptions, 'main-agent', []);
+  assert.strictEqual(bodyNone.model, 'm1');
+  assert.ok(!('reasoning_effort' in bodyNone), 'the no-parameter position sends nothing at all');
+  assert.ok(!('max_tokens' in bodyNone), 'the main agent never clamps output');
   const bodyHigh = buildRequestBody(entry, 'high', [{ role: 1, content: [new LanguageModelTextPart('hi')] }], noopOptions, 'main-agent', []);
-  assert.strictEqual(bodyHigh.reasoning_effort, 'high', 'the gear rides out verbatim');
-  const bodyOff = buildRequestBody(entry, 'none', [{ role: 1, content: [new LanguageModelTextPart('hi')] }], noopOptions, 'main-agent', []);
-  assert.strictEqual(bodyOff.reasoning_effort, 'none');
+  assert.strictEqual(bodyHigh.reasoning_effort, 'high', 'the other positions ride out verbatim');
+  assert.strictEqual(thinkingEffortParam('medium'), 'medium', 'id === wire for the explicit positions');
+  assert.strictEqual(thinkingEffortParam('none'), undefined);
   // Helper requests never carry it: a chat title must not pay for chain-of-thought.
   const bodyTitle = buildRequestBody(entry, 'high', [{ role: 1, content: [new LanguageModelTextPart('hi')] }], noopOptions, 'chat-title', []);
   assert.ok(!('reasoning_effort' in bodyTitle), 'helper requests drop the effort');
@@ -323,100 +336,29 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
   assert.deepStrictEqual(readModelLimitOverrides({}), {});
   assert.deepStrictEqual(readModelLimitOverrides({ modelOptions: { maxInputTokens: '' } }), {});
 
-  // The context-window dropdown is the SAME override as maxInputTokens, and it
-  // wins when a stale stored maxInputTokens rides along with it.
-  assert.deepStrictEqual(
-    readModelLimitOverrides({ modelOptions: { contextSize: 262144 } }),
-    { maxInputTokens: 262144 },
-    'contextSize becomes the input budget'
-  );
-  assert.deepStrictEqual(
-    readModelLimitOverrides({ modelOptions: { contextSize: '524288', maxInputTokens: 999 } }),
-    { maxInputTokens: 524288 },
-    'dropdown beats the raw field'
-  );
-
-  // Window rungs: ONE fixed ladder for every model, ASCENDING 64K up to 1M
-  // (this is the order the gear panel renders). It does not depend on the
-  // ceiling and does not collapse after a pick.
-  const LADDER = [65536, 131072, 262144, 524288, 1048576];
-  assert.deepStrictEqual(
-    [...CONTEXT_WINDOW_TIERS],
-    LADDER,
-    'the ladder is declared ASCENDING — every index-based read depends on it'
-  );
-  const rungs = contextTierOptions(1048576);
-  assert.deepStrictEqual(
-    rungs.map((tier) => tier.tokens),
-    LADDER,
-    'every model offers the same ladder'
-  );
-  assert.strictEqual(rungs[0].label, '64K', '64K is the floor');
-  assert.strictEqual(rungs[rungs.length - 1].label, '1M', '1M reads as 1M, not 1024K');
-  assert.deepStrictEqual(
-    contextTierOptions(131072).map((tier) => tier.tokens),
-    LADDER,
-    'a picked rung is a ladder member already — no duplicate, no collapse'
-  );
-  assert.deepStrictEqual(
-    contextTierOptions(524288).map((tier) => tier.tokens),
-    LADDER,
-    'picking 512K keeps 1M reachable'
-  );
-  assert.ok(
-    contextTierOptions(700000).some((tier) => tier.tokens === 700000),
-    'a hand-set ceiling stays selectable (schema default must be in its own enum)'
-  );
-  assert.deepStrictEqual(
-    contextTierOptions(700000).map((tier) => tier.tokens),
-    [65536, 131072, 262144, 524288, 700000, 1048576],
-    'the hand-set value is slotted into the ladder by value, not appended'
-  );
-
-  // The starting rung: the largest one that does not exceed the real window.
-  assert.strictEqual(defaultContextTier(1048576), 1048576, '1M model starts at 1M');
-  assert.strictEqual(defaultContextTier(1047576), 1048576, 'round preset figures fit the rung');
-  assert.strictEqual(defaultContextTier(272000), 262144, '272K starts at 256K');
-  assert.strictEqual(defaultContextTier(200000), 131072, '200K starts at 128K');
-  assert.strictEqual(defaultContextTier(128000), 131072, '128K starts at 128K, not 64K');
-  assert.strictEqual(defaultContextTier(32000), 65536, 'below the floor → the smallest rung');
-
-  // Resolution snaps the preset window onto the ladder (hand-set values do not).
-  assert.strictEqual(
-    resolveProfileEntry(bareProfile('glm-4.6')).maxInputTokens,
-    131072,
-    '200K preset snaps down to the 128K rung'
-  );
-  assert.strictEqual(
-    resolveProfileEntry(bareProfile('gpt-5.1')).maxInputTokens,
-    262144,
-    '272K preset snaps down to the 256K rung'
-  );
-  assert.strictEqual(
-    resolveProfileEntry(bareProfile('glm-5')).maxInputTokens,
-    1048576,
-    '1M preset starts at 1M'
-  );
-
-  // Summaries show the REAL ceiling, not the rung — until the user sets one.
-  assert.strictEqual(realInputCeiling('glm-4.6'), 200000, 'real ceiling is pre-ladder');
+  // The declaration IS the model's real window now — no ladder snapping.
+  assert.strictEqual(realInputCeiling('glm-4.6'), 200000, 'preset figure is the real window');
+  assert.strictEqual(resolveProfileEntry(bareProfile('glm-4.6')).maxInputTokens, 200000,
+    'a 200K model declares 200K — it no longer snaps down onto a 128K rung');
+  assert.strictEqual(resolveProfileEntry(bareProfile('gpt-5.1')).maxInputTokens, 272000,
+    'a 272K model declares 272K');
   assert.strictEqual(realInputCeiling('obscure-model'), 1048576, 'unknown id → 1M');
   assert.strictEqual(
     summaryInputTokens({ model: 'glm-4.6', maxInputTokens: 0 }),
     200000,
-    'a 200K model is summarized as 200K, not as its 128K starting rung'
+    'a 200K model is summarized as 200K'
   );
   assert.strictEqual(
     summaryInputTokens({ model: 'glm-4.6', maxInputTokens: 65536 }),
     65536,
-    'a picked rung is what the summary shows'
+    'a hand-set limit is what the summary shows'
   );
   // Two notations on purpose: preset ceilings are decimal (a 200K window),
-  // rungs are binary (131072 IS 128K).
+  // binary figures stay binary (131072 IS 128K).
   assert.strictEqual(summaryWindowLabel(200000), '200K', 'decimal — not 195K');
   assert.strictEqual(summaryWindowLabel(1048576), '1M');
-  assert.strictEqual(tokenWindowLabel(131072), '128K', 'rungs stay binary');
-  assert.strictEqual(tokenWindowLabel(1048576), '1M', '1M rung, not 1024K');
+  assert.strictEqual(tokenWindowLabel(131072), '128K', 'binary label');
+  assert.strictEqual(tokenWindowLabel(1048576), '1M', '1M, not 1024K');
 
   // Apply: >0 replaces the field for THIS request; 0 keeps the resolved value.
   const gamma = resolveProfileEntry(bareProfile('glm-5'));
@@ -504,6 +446,78 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
       'picker id round-trips'
     );
     assert.strictEqual(cfg.decodePickerId('deepseek-v4-pro-0813'), undefined, 'bare id decodes to nothing');
+
+    // --- window rungs: the named windows rebased onto the row's own output ---
+    // The label is the TOTAL the host's ring will show (input + output), so a
+    // rung is never labelled with a number the user cannot pick.
+    assert.strictEqual(cfg.hostWindowLabel(256000), '256K');
+    assert.strictEqual(cfg.hostWindowLabel(1179648), '1.1M', 'the M band keeps one decimal');
+    assert.strictEqual(cfg.hostWindowLabel(1000000), '1M');
+    assert.strictEqual(cfg.hostWindowLabel(950000), '1M', 'everything above 900K reads 1M');
+    assert.deepStrictEqual(
+      cfg.windowCandidates('deepseek-v4-pro-0813', 131072).map((tier) => [tier.maxInputTokens, tier.label]),
+      [
+        [124928, '256K'],
+        [380928, '512K'],
+        [868928, '1M'],
+      ],
+      'only the NAMED windows are rungs, rebased onto the output'
+    );
+    // The model's own ceiling is NOT a rung: it reads as a number nobody asked
+    // for (1M input + 128K answer = 1.1M). A window outside the named set is
+    // the wizard's 「自定义…」, which follows the same labelling rule.
+    assert.strictEqual(
+      cfg.windowCandidates('deepseek-v4-pro-0813', 131072).some((tier) => tier.label === '1.1M'),
+      false,
+      'no ceiling-derived rung in the list'
+    );
+    assert.strictEqual(cfg.customWindowTier(1048576, 131072).label, '1.1M', 'a typed budget is labelled by its ring total');
+    assert.strictEqual(cfg.customWindowTier(300000, 131072).label, '431K');
+    // A 128K tier cannot coexist with a 128K answer: it is dropped, not sent
+    // negative.
+    assert.strictEqual(
+      cfg.windowCandidates('deepseek-v4-pro-0813', 131072).some((tier) => tier.maxInputTokens <= 0),
+      false,
+      'non-positive rungs never reach the picker'
+    );
+    assert.deepStrictEqual(
+      cfg.normalizeWindowInputs([262144, 'x', -1, 262144], 1048576),
+      [262144, 1048576],
+      'rungs are integers, de-duplicated, sorted, and the declaration is a member'
+    );
+
+    // --- effort rungs: a row may offer a SUBSET (or none at all) -------------
+    assert.deepStrictEqual(cfg.resolveReasoningIds(undefined), [...cfg.THINKING_EFFORTS], 'absent = every position');
+    assert.deepStrictEqual(cfg.resolveReasoningIds([]), [], 'empty = no control at all');
+    assert.deepStrictEqual(cfg.resolveReasoningIds(['high', 'low', 'nope']), ['low', 'high'], 'table order, unknowns dropped');
+    assert.strictEqual(cfg.resolveDefaultThinking(undefined, ['low', 'high']), 'high', 'the shared default when offered');
+    assert.strictEqual(cfg.resolveDefaultThinking('none', ['low', 'high']), 'high', 'a non-member falls back');
+    assert.strictEqual(cfg.resolveThinkingEffort('medium', ['low', 'high']), 'high', 'the request path narrows to the row');
+    assert.strictEqual(cfg.resolveThinkingEffort('medium', []), 'none', 'no rungs = send nothing');
+
+    // The resolved entry carries both controls, and only when there is a choice.
+    const wide = cfg.resolveProfileEntry({
+      key: 'p6',
+      name: '',
+      baseURL: 'https://e.example/v1',
+      model: 'deepseek-v4-pro-0813',
+      maxInputTokens: 380928,
+      maxOutputTokens: 131072,
+      windowInputs: [124928, 380928, 1048576],
+      reasoningIds: ['low', 'high'],
+      defaultThinkingEffort: 'high',
+    });
+    assert.deepStrictEqual(
+      wide.contextTiers.map((tier) => tier.maxInputTokens),
+      [124928, 380928, 1048576],
+      'the declared window is one of the rungs'
+    );
+    assert.strictEqual(wide.contextTiers.find((tier) => tier.maxInputTokens === 380928).label, '512K');
+    assert.deepStrictEqual(wide.reasoningEfforts, ['low', 'high']);
+    assert.strictEqual(wide.defaultThinkingEffort, 'high');
+    const narrow = cfg.resolveProfileEntry(one[0]);
+    assert.strictEqual(narrow.contextTiers, undefined, 'one window = no control');
+    assert.deepStrictEqual(narrow.reasoningEfforts, [...cfg.THINKING_EFFORTS], 'no subset = all positions');
 
     // Per-profile limits: explicit > preset > default.
     assert.strictEqual(cfg.resolveProfileEntry(store.readProfile('p2')).maxInputTokens, 32000, 'explicit profile limit wins');
@@ -608,7 +622,8 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
     const model = 'deepseek-v4.1-flash-1017';
     assert.strictEqual(cap.endpointKey('https://TokenHub.Example.com/v1/'), 'tokenhub.example.com/v1', 'endpoint key normalises host case + trailing slash');
     assert.strictEqual(cap.effortVerdict(gw, model, 'medium'), 'unknown', 'nothing known yet');
-    assert.strictEqual(cap.effortVerdict(gw, model, 'auto'), 'supported', 'auto puts nothing on the wire');
+    assert.strictEqual(cap.effortVerdict(gw, model, 'auto'), 'supported', 'the retired no-parameter spelling puts nothing on the wire');
+    assert.strictEqual(cap.effortVerdict(gw, model, 'none'), 'supported', 'the no-parameter position can never be refused');
 
     // Only an ENUMERATED list is worth parsing; prose teaches nothing.
     const listDetail = 'Invalid reasoning_effort: must be one of low, high, max';
@@ -619,7 +634,7 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
     assert.strictEqual(await cap.recordEffortVerdict(gw, model, 'medium', 'rejected', listDetail), true, 'first refusal is a change');
     assert.strictEqual(cap.effortVerdict(gw, model, 'medium'), 'rejected');
     assert.strictEqual(cap.effortVerdict(gw, model, 'high'), 'supported', 'the list answers for values never tried');
-    assert.strictEqual(cap.effortVerdict(gw, model, 'none'), 'rejected', 'a value missing from the list is refused');
+    assert.strictEqual(cap.effortVerdict(gw, model, 'minimal'), 'rejected', 'a value missing from the list is refused');
     assert.strictEqual(cap.fallbackEffort(gw, model), 'high', 'fallback prefers high');
     assert.strictEqual(cap.effortVerdict(gw, 'another-model', 'medium'), 'unknown', 'learning is per model');
 
@@ -638,11 +653,13 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
     assert.notStrictEqual(cap.effortVerdict(gw, model, 'medium'), 'rejected', 'a 200 un-refuses the value');
 
     // Three refusals with no list = the FIELD is refused, not one value.
+    // (`none` is not in this loop: it never reaches the wire, so it can never
+    // be refused — see effortVerdict.)
     const strict = 'https://b.example/v1';
-    for (const value of ['none', 'medium', 'low']) {
+    for (const value of ['low', 'medium', 'high']) {
       await cap.recordEffortVerdict(strict, 'glm-5.3', value, 'rejected', 'unsupported reasoning_effort');
     }
-    assert.strictEqual(cap.effortVerdict(strict, 'glm-5.3', 'high'), 'rejected', 'no list + three refusals → field refusal');
+    assert.strictEqual(cap.effortVerdict(strict, 'glm-5.3', 'medium'), 'rejected', 'no list + three refusals → field refusal');
     assert.strictEqual(cap.fallbackEffort(strict, 'glm-5.3'), undefined, 'nothing safe left → caller drops the parameter');
 
     // An activation in another window re-reads what this one learned.
@@ -701,6 +718,76 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
       'non-/v1 prefixes are preserved'
     );
 
+  });
+}).then(() => {
+  // --- harness sync: only state that can NEVER resolve is removed ---
+  const { pruneAllowList, pruneModelSettings } = require('../out/harnessSync.js');
+
+  const allow = {
+    'customforcopilot.custom-for-copilot': true,
+    'CustomforCopilot.custom-for-copilot-chat': true,
+    'CustomforCopilot.custom-for-copilot': true,
+    'someone.else-entirely': true,
+  };
+  const prunedAllow = pruneAllowList(allow, 'CustomforCopilot.custom-for-copilot');
+  assert.deepStrictEqual(
+    prunedAllow.removed.sort(),
+    ['CustomforCopilot.custom-for-copilot-chat', 'customforcopilot.custom-for-copilot'],
+    'previous ids of this extension are removed, case-insensitively'
+  );
+  assert.deepStrictEqual(
+    Object.keys(prunedAllow.next).sort(),
+    ['CustomforCopilot.custom-for-copilot', 'someone.else-entirely'],
+    'the current id and other extensions survive'
+  );
+
+  const groups = [
+    {
+      name: '自定义模式',
+      vendor: 'custommodel',
+      settings: { 'pmw3knhmdkydk::kimi-k3.1-pro': { reasoningEffort: 'high' }, 'live::m': {} },
+    },
+    {
+      name: 'Copilot',
+      vendor: 'agent-host-copilotcli',
+      settings: {
+        'custommodel/stale::m2': { thinkingLevel: 'high' },
+        'custommodel/live::m': { thinkingLevel: 'high' },
+        'copilot/gpt-5': { thinkingLevel: 'high' },
+      },
+    },
+  ];
+  const prunedSettings = pruneModelSettings(groups, new Set(['live::m']));
+  assert.deepStrictEqual(
+    prunedSettings.removed,
+    ['custommodel: pmw3knhmdkydk::kimi-k3.1-pro', 'agent-host-copilotcli: custommodel/stale::m2'],
+    'dead settings are named in the report'
+  );
+  assert.deepStrictEqual(
+    Object.keys(prunedSettings.next[0].settings),
+    ['live::m'],
+    'our own vendor group keeps only live ids'
+  );
+  assert.deepStrictEqual(
+    Object.keys(prunedSettings.next[1].settings).sort(),
+    ['copilot/gpt-5', 'custommodel/live::m'],
+    "another vendor's models and our live id survive"
+  );
+}).then(() => {
+  // --- reasoning run identity: one id per contiguous burst ---
+  const reasoningEvents = [
+    'data: {"choices":[{"delta":{"reasoning_content":"a"}}]}\n\n',
+    'data: {"choices":[{"delta":{"reasoning_content":"b"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+    'data: {"choices":[{"delta":{"reasoning_content":"c"}}]}\n\n',
+  ];
+  const reasoningParts = [];
+  return streamSseToProgress(sseResponse(reasoningEvents).body, { report: (p) => reasoningParts.push(p) }, token).then(() => {
+    const ids = reasoningParts.filter((p) => p instanceof LanguageModelThinkingPart).map((p) => p.id);
+    assert.strictEqual(ids.length, 3, 'every reasoning delta is reported');
+    assert.ok(ids[0], 'a run carries an id');
+    assert.strictEqual(ids[1], ids[0], 'a contiguous burst shares one id');
+    assert.notStrictEqual(ids[2], ids[0], 'assistant text ends the run');
     console.log('SMOKE OK — all pure-logic assertions passed');
   });
 }).catch((err) => { console.error(err); process.exit(1); });

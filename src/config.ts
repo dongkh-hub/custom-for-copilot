@@ -7,8 +7,8 @@
  * Code profile on this machine sees the same groups. This module owns what a
  * group IS ({ key, name, baseURL, model, noAuth?, maxInputTokens,
  * maxOutputTokens }) and everything derived from it: the official preset
- * chain, the picker id encoding, the context-window rungs and the
- * thinking-effort gear. API keys stay in SecretStorage too, under
+ * chain, the picker id encoding and the thinking-effort gear. API keys stay in
+ * SecretStorage too, under
  * `customModel.apiKey.<profileKey>`. The request path reads the list and the
  * key PER REQUEST — a swap takes effect on the next chat message with no
  * reload.
@@ -19,16 +19,22 @@
  *     > the preset detected from the model id (official vendor figures)
  *     > the 1M/128K mainstream default
  *
- * ...and the INPUT side has one extra step: unless it was hand-set, the
- * resolved window snaps DOWN onto the fixed context ladder
- * ({@link CONTEXT_WINDOW_TIERS}), so the declared budget is always a rung the
- * gear panel can show as its own default. The ladder is the same for every
- * model — the preset only decides WHICH rung a model starts on
- * ({@link defaultContextTier}).
- *
  * `0` (the default) means "auto": the preset chain rules. Everything else
  * this extension does (helper-request downgrade, tool-list stabilization,
  * thinking passthrough) is fixed behavior — there are no hidden switches.
+ *
+ * The window is a DECLARATION the host sizes on, and a rung set is a CHOICE on
+ * top of it. A row may offer several windows (`Profile.windowInputs`); the
+ * model panel then shows the `contextSize` dropdown, and whichever rung is
+ * DECLARED (`maxInputTokens`) is what a harness without that panel applies.
+ * Only one of the two harnesses renders the panel, which is why the declared
+ * value — never the last panel pick — is what the session is sized against in
+ * the other one, and why the panel default has to equal the declaration.
+ *
+ * The effort dimension works the same way: `Profile.reasoningIds` is the set
+ * the panel offers, `defaultThinkingEffort` is the position a request uses
+ * before anyone touches it. No rung set at all = one window and every effort
+ * position, i.e. the behaviour of an install that never configured either.
  *
  * The preset REGEXES recognize the ids of mainstream models so their limits
  * apply automatically; the preset ids/labels stay neutral (alpha/beta/gamma)
@@ -36,7 +42,7 @@
  * is NO universal input:output ratio — each model caps output per id, and
  * reasoning models keep their own (larger) output budget because reasoning
  * tokens count toward it. When a gateway serves ids no preset recognizes,
- * the mainstream default applies and the gear panel can pin real numbers.
+ * the mainstream default applies and the profile's limits can pin real numbers.
  */
 import * as vscode from 'vscode';
 
@@ -63,8 +69,9 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 131072;
 export interface ModelLimits {
   /**
    * Declared prompt budget the HOST sizes the conversation history against.
-   * Always a rung of {@link CONTEXT_WINDOW_TIERS} unless the user set one by
-   * hand (the gear panel writes its pick back into the profile verbatim).
+   * The model's real window (preset figure or mainstream default) unless the
+   * profile pins a number — there is no gear control for it any more (see the
+   * module docblock).
    */
   readonly maxInputTokens: number;
   /** Declared output ceiling reserved for the answer. */
@@ -156,7 +163,7 @@ export function detectModelPreset(id: string): ModelPreset | undefined {
 
 /**
  * The model's REAL input ceiling: the preset figure, or the mainstream
- * default — taken BEFORE the ladder snaps it onto a rung.
+ * default. This is what the entry declares.
  */
 export function realInputCeiling(model: string): number {
   return detectModelPreset(model)?.maxInputTokens ?? DEFAULT_MAX_INPUT_TOKENS;
@@ -166,9 +173,9 @@ export function realInputCeiling(model: string): number {
  * The input figure the SUMMARY lines show (settings mirror, manager list):
  * the model's real ceiling until the user overrides it, then their number.
  *
- * Deliberately NOT the resolved value: a rung is a BUDGET, so printing `128K`
- * for a 200K model would read as "that is all it can do". The rung is what
- * the gear panel STARTS that model on, not its window.
+ * Identical to the resolved value now that the ladder is gone — kept as a
+ * separate name so the summary keeps its own meaning ("what this model is"),
+ * independent of what the declaration happens to be.
  */
 export function summaryInputTokens(profile: Pick<Profile, 'model' | 'maxInputTokens'>): number {
   return profile.maxInputTokens > 0 ? profile.maxInputTokens : realInputCeiling(profile.model);
@@ -180,12 +187,27 @@ export interface ModelEntry extends ModelLimits {
   readonly id: string;
   /** The preset that supplied the limits, if any (wizard summary / docs). */
   readonly presetLabel?: string;
+  /**
+   * Effort positions this row may be used at, in table order. Empty = the row
+   * offers no control at all (an upstream that rejects `reasoning_effort`).
+   */
+  readonly reasoningEfforts: readonly ThinkingEffort[];
+  /**
+   * Position applied when the host sends nothing — the one the panel
+   * pre-selects. A member of `reasoningEfforts`; undefined only when empty.
+   */
+  readonly defaultThinkingEffort?: ThinkingEffort;
+  /**
+   * Windows this row may be used at, the DECLARED one included. Absent = the
+   * declaration is the only window (no panel control, today's behaviour).
+   */
+  readonly contextTiers?: readonly ModelWindowTier[];
 }
 
-/** Shared output channel ("Custom for Copilot Chat") for diagnostics that must survive without a debugger. */
+/** Shared output channel ("Custom for Copilot") for diagnostics that must survive without a debugger. */
 let channel: vscode.OutputChannel | undefined;
 export function modelOutput(): vscode.OutputChannel {
-  channel ??= vscode.window.createOutputChannel('Custom for Copilot Chat');
+  channel ??= vscode.window.createOutputChannel('Custom for Copilot');
   return channel;
 }
 
@@ -229,6 +251,24 @@ export interface Profile {
   readonly maxInputTokens: number;
   /** Explicit output ceiling (`0` = auto: preset chain). */
   readonly maxOutputTokens: number;
+  /**
+   * Windows this row may be used at, as INPUT budgets, the declared one
+   * (`maxInputTokens`) included. Two or more = the model panel shows a
+   * `contextSize` dropdown and `maxInputTokens` is the pre-selected rung.
+   *
+   * Absent = one window, exactly the behaviour of every install that never
+   * asked: the declared budget and no control for it.
+   */
+  readonly windowInputs?: readonly number[];
+  /**
+   * Effort positions this row offers, as `THINKING_EFFORTS` ids. Absent =
+   * every position (the default), EMPTY = no control at all — the honest
+   * answer for a gateway that rejects `reasoning_effort`, and the only way to
+   * say so.
+   */
+  readonly reasoningIds?: readonly ThinkingEffort[];
+  /** Position the panel pre-selects; MUST be a member of `reasoningIds`. */
+  readonly defaultThinkingEffort?: ThinkingEffort;
 }
 
 /** Model id handed to VS Code: unique even when two profiles share a model. */
@@ -309,6 +349,19 @@ export function parseProfile(raw: unknown): Profile | undefined {
   }
   const limit = (value: unknown): number =>
     typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  const maxInputTokens = limit(record.maxInputTokens);
+  // Rung sets are re-checked against what this row can actually declare: a
+  // window above the model's ceiling, or an effort id a later build retired,
+  // would otherwise reach the panel as an option it can never honour.
+  const windowInputs = normalizeWindowInputs(
+    record.windowInputs,
+    maxInputTokens > 0 ? maxInputTokens : realInputCeiling(model)
+  );
+  // An ARRAY is taken literally (an empty one means "no control"); an absent
+  // field stays absent so `resolveReasoningIds` can read it as "every rung".
+  const reasoningIds = Array.isArray(record.reasoningIds)
+    ? resolveReasoningIds(record.reasoningIds)
+    : undefined;
   return {
     key,
     name: text(record.name),
@@ -317,8 +370,13 @@ export function parseProfile(raw: unknown): Profile | undefined {
     // Only the explicit `true` counts: a hand-edited payload saying
     // `"noAuth": "false"` must not silently disable authentication.
     ...(record.noAuth === true ? { noAuth: true } : {}),
-    maxInputTokens: limit(record.maxInputTokens),
+    maxInputTokens,
     maxOutputTokens: limit(record.maxOutputTokens),
+    ...(windowInputs.length > 1 ? { windowInputs } : {}),
+    ...(reasoningIds ? { reasoningIds } : {}),
+    ...(reasoningIds?.length
+      ? { defaultThinkingEffort: resolveDefaultThinking(record.defaultThinkingEffort, reasoningIds) }
+      : {}),
   };
 }
 
@@ -326,25 +384,219 @@ export function parseProfile(raw: unknown): Profile | undefined {
 // `profileStore.ts`: it is stored in the user-level credential store so every
 // VS Code profile on the machine shares one set of groups.
 
+// --- Window rungs and effort rungs -------------------------------------------
+//
+// A row may offer SEVERAL windows and SEVERAL effort positions; the model
+// panel then shows one dropdown per dimension. The DECLARED window and the
+// DEFAULT effort are what a harness without that panel (Copilot) applies, so
+// asking for both keeps the two hosts describing the same model.
+
+/** One rung of the model panel's `contextSize` control. */
+export interface ModelWindowTier {
+  /** Stable id (wizard pick payload; never a picker id). */
+  readonly id: string;
+  /** The TOTAL window the host shows: `maxInputTokens + maxOutputTokens`. */
+  readonly label: string;
+  /** Declared prompt budget of this rung. */
+  readonly maxInputTokens: number;
+  /** Answer reserve of this rung — the ROW's ceiling for every rung. */
+  readonly maxOutputTokens: number;
+}
+
+/**
+ * The named windows a row may offer, ascending.
+ *
+ * Each carries the output it was named against, so the total is the round
+ * number on its label (`256K` = 223232 + 32768). A row REBASES them onto its
+ * own output — see {@link windowCandidates} — because the host adds that
+ * output to whichever input is selected, and a label that stopped matching
+ * that sum would describe a window nobody can pick.
+ */
+export const MODEL_WINDOW_TIERS: readonly ModelWindowTier[] = [
+  { id: 'tier-128k', label: '128K', maxInputTokens: 111616, maxOutputTokens: 16384 },
+  { id: 'tier-256k', label: '256K', maxInputTokens: 223232, maxOutputTokens: 32768 },
+  { id: 'tier-512k', label: '512K', maxInputTokens: 446464, maxOutputTokens: 65536 },
+  { id: 'tier-1m', label: '1M', maxInputTokens: 934464, maxOutputTokens: 65536 },
+];
+
+/** `input + output` — the number the host's context ring shows. */
+export function windowTierTotal(
+  tier: Pick<ModelWindowTier, 'maxInputTokens' | 'maxOutputTokens'>
+): number {
+  return tier.maxInputTokens + tier.maxOutputTokens;
+}
+
+/**
+ * The host's own abbreviation of a TOTAL window (its `$E` helper): base-1000,
+ * one decimal in the M band, everything above 900K read as `1M`.
+ *
+ * The THIRD label function in this module, and the only one allowed on a
+ * window rung. `tokenWindowLabel` is binary (an output of 131072 is `128K`)
+ * and `summaryWindowLabel` is the vendor's decimal figure; a rung label has to
+ * be the number the context ring will show, or the panel and the ring
+ * disagree about the very choice the user just made.
+ */
+export function hostWindowLabel(totalTokens: number): string {
+  if (totalTokens >= 1_000_000) {
+    const millions = Math.floor((totalTokens / 1_000_000) * 10) / 10;
+    return millions % 1 === 0 ? `${millions.toFixed(0)}M` : `${millions.toFixed(1)}M`;
+  }
+  if (totalTokens > 900_000) {
+    return '1M';
+  }
+  if (totalTokens >= 1_000) {
+    return `${Math.round(totalTokens / 1_000)}K`;
+  }
+  return String(totalTokens);
+}
+
+/**
+ * The NAMED windows one row may offer, rebased onto its own output.
+ *
+ * Only the table's windows — the model's own ceiling is NOT one of them. A
+ * ceiling-derived rung reads as a number nobody asked for (`1.1M` for a 1M
+ * model, because the ring adds the answer reserve), and a list is supposed to
+ * offer the windows people name. A window outside this set is the wizard's
+ * 「自定义…」 rung, which the user types themselves (see
+ * {@link customWindowTier}).
+ *
+ * A tier whose input goes non-positive after the rebase, or that would exceed
+ * the model's ceiling, is dropped: a 128K window cannot also reserve a 128K
+ * answer.
+ */
+export function windowCandidates(model: string, outputTokens: number): ModelWindowTier[] {
+  const ceiling = realInputCeiling(model);
+  const inputs = new Set<number>();
+  for (const tier of MODEL_WINDOW_TIERS) {
+    const input = windowTierTotal(tier) - outputTokens;
+    if (input > 0 && input < ceiling) {
+      inputs.add(input);
+    }
+  }
+  return [...inputs]
+    .sort((a, b) => a - b)
+    .map((input) => customWindowTier(input, outputTokens));
+}
+
+/**
+ * One rung from a raw INPUT budget — what 「自定义…」 produces.
+ *
+ * Same labelling rule as the named tiers (the total the ring will show), so a
+ * typed window sits in the dropdown next to the others without a second
+ * convention.
+ */
+export function customWindowTier(inputTokens: number, outputTokens: number): ModelWindowTier {
+  return {
+    id: `w${inputTokens}`,
+    label: hostWindowLabel(inputTokens + outputTokens),
+    maxInputTokens: inputTokens,
+    maxOutputTokens: outputTokens,
+  };
+}
+
+/**
+ * Keep only real input budgets, ascending, with the DECLARED one included.
+ *
+ * The declared window must be in the set: the panel's `default` has to be a
+ * member of its own `enum` — the host deletes a stored value that equals the
+ * default, and a default outside the enum leaves the control showing a value
+ * it cannot select.
+ */
+export function normalizeWindowInputs(value: unknown, declared: number): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const kept = new Set<number>();
+  for (const item of value) {
+    if (typeof item !== 'number' || !Number.isFinite(item)) {
+      continue;
+    }
+    const input = Math.floor(item);
+    if (input > 0) {
+      kept.add(input);
+    }
+  }
+  if (kept.size === 0) {
+    return [];
+  }
+  if (declared > 0) {
+    kept.add(declared);
+  }
+  return [...kept].sort((a, b) => a - b);
+}
+
+/**
+ * The effort positions a stored row offers, in TABLE order.
+ *
+ * `undefined` (never chosen) means every position — the behaviour every
+ * existing install has. An ARRAY is taken literally, including an empty one:
+ * "this gateway takes no `reasoning_effort`" is a real answer, and the only
+ * way to keep the control off a row that would otherwise get it back through
+ * the default.
+ */
+export function resolveReasoningIds(value: unknown): ThinkingEffort[] {
+  if (!Array.isArray(value)) {
+    return [...THINKING_EFFORTS];
+  }
+  return THINKING_EFFORTS.filter((effort) => value.includes(effort));
+}
+
+/**
+ * The position the panel pre-selects: the stored pick when it is still
+ * offered, else the shared default when offered, else the first one. A
+ * non-member would be ignored by the host silently.
+ */
+export function resolveDefaultThinking(
+  value: unknown,
+  allowed: readonly ThinkingEffort[]
+): ThinkingEffort | undefined {
+  if (allowed.length === 0) {
+    return undefined;
+  }
+  const wanted = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  const member = allowed.find((effort) => effort === wanted);
+  if (member) {
+    return member;
+  }
+  return allowed.includes(DEFAULT_THINKING_EFFORT) ? DEFAULT_THINKING_EFFORT : allowed[0];
+}
+
 /** Limits of one profile, resolved through the preset chain. */
 export function resolveProfileEntry(profile: Profile): ModelEntry {
   const preset = detectModelPreset(profile.model);
+  const maxOutputTokens =
+    profile.maxOutputTokens > 0
+      ? profile.maxOutputTokens
+      : preset?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  // A hand-set value is kept verbatim; otherwise the model's real window is
+  // declared as-is. Both harnesses read this one number — a rung set only
+  // changes what the panel may switch TO, never what the row declares.
+  const maxInputTokens =
+    profile.maxInputTokens > 0 ? profile.maxInputTokens : realInputCeiling(profile.model);
+  const reasoningEfforts = resolveReasoningIds(profile.reasoningIds);
+  const windowInputs = normalizeWindowInputs(profile.windowInputs, maxInputTokens);
   return {
     id: profile.model,
-    // A hand-set value (a rung picked in the gear panel, or a hand-typed
-    // number) is kept verbatim; the preset's real window otherwise snaps DOWN
-    // onto the ladder, so the declared window is always a rung the gear panel
-    // can show as its own `default`.
-    maxInputTokens:
-      profile.maxInputTokens > 0
-        ? profile.maxInputTokens
-        : defaultContextTier(realInputCeiling(profile.model)),
-    maxOutputTokens:
-      profile.maxOutputTokens > 0
-        ? profile.maxOutputTokens
-        : preset?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    maxInputTokens,
+    maxOutputTokens,
     reasoning: preset?.reasoning ?? false,
     ...(preset ? { presetLabel: preset.label } : {}),
+    reasoningEfforts,
+    ...(reasoningEfforts.length > 0
+      ? { defaultThinkingEffort: resolveDefaultThinking(profile.defaultThinkingEffort, reasoningEfforts) }
+      : {}),
+    // ONE rung is the declaration restated — a one-item dropdown would claim
+    // otherwise, so the control is only carried when there is a choice.
+    ...(windowInputs.length > 1
+      ? {
+          contextTiers: windowInputs.map((input) => ({
+            id: `w${input}`,
+            label: hostWindowLabel(input + maxOutputTokens),
+            maxInputTokens: input,
+            maxOutputTokens,
+          })),
+        }
+      : {}),
   };
 }
 
@@ -379,8 +631,9 @@ export async function writeProfileApiKey(
 /**
  * Rough token figure for a label: 96000 → `94K`, 65536 → `64K`,
  * 1048576 → `1M`. The M step matters — "1024K" is not what anyone picks a
- * window by, and the gear panel's own ladder label has to match the summary
- * lines that show the same number.
+ * window by, and the summary lines that print an output ceiling use this.
+ *
+ * Binary on purpose: the figures this labels ARE binary (65536 is 64K).
  */
 export function tokenWindowLabel(tokens: number): string {
   return tokens >= 1048576 ? `${Math.round(tokens / 1048576)}M` : `${Math.round(tokens / 1024)}K`;
@@ -392,75 +645,13 @@ export function tokenWindowLabel(tokens: number): string {
  *
  * Not {@link tokenWindowLabel}: preset ceilings are quoted in decimal (a
  * 200K window), and dividing them by 1024 prints 195K — a number that
- * matches nothing the user has read anywhere. Rungs stay on the binary
- * label because 131072 IS 128K.
+ * matches nothing the user has read anywhere.
  */
 export function summaryWindowLabel(tokens: number): string {
   return tokens >= 1000000 ? `${Math.round(tokens / 1000000)}M` : `${Math.round(tokens / 1000)}K`;
 }
 
-/**
- * The context-window ladder: ONE fixed set of rungs for EVERY model, ASCENDING
- * (64K up to 1M) — this is the order the gear panel renders them in.
- *
- * The rungs are deliberately NOT derived from the model. A ladder derived
- * from the ceiling collapsed on the first pick — choose 512K of 1M and the
- * 1M rung disappeared — and one derived from the currently effective value
- * could never offer anything above it. A fixed ladder has neither problem,
- * and it is the same ladder everywhere, so what the user learns once applies
- * to every model they add later.
- *
- * 64K is the floor: the host spends part of the budget on the answer, and a
- * vendor's round figure (128000) is not the whole window, so the smallest
- * rung has to leave room under a 128K model.
- *
- * Everything that reads this array must stay order-agnostic: the ladder is
- * ASCENDING, so the smallest rung is `[0]` and the fitting rung of
- * `defaultContextTier` is the LAST one, not the first.
- */
-export const CONTEXT_WINDOW_TIERS: readonly number[] = [
-  65536, 131072, 262144, 524288, 1048576,
-];
 
-/**
- * How far a rung may exceed a real ceiling and still count as fitting (8K).
- * Preset figures are round decimal — 128000 for a 128K window, 1047576 for a
- * 1M one — and without the slack those would snap a whole rung down over a
- * few KB of rounding.
- */
-const TIER_FIT_SLACK = 8192;
-
-/**
- * The rungs offered for ONE model: the fixed ladder, plus the model's
- * currently effective value when that is not already a rung.
- *
- * The extra member is what keeps a HAND-TYPED window reachable: the schema's
- * `default` is the effective value, and a default that is not a member of its
- * own enum leaves the host with an empty dropdown. It is slotted in by VALUE
- * (the ladder is ascending), not appended — a hand-set 700K between two rungs
- * must not read as "bigger than 1M".
- */
-export function contextTierOptions(current?: number): readonly { tokens: number; label: string }[] {
-  const tokens = CONTEXT_WINDOW_TIERS.filter((tier) => tier !== current);
-  if (current !== undefined && current > 0) {
-    tokens.push(current);
-    tokens.sort((left, right) => left - right);
-  }
-  return tokens.map((value) => ({ tokens: value, label: tokenWindowLabel(value) }));
-}
-
-/**
- * The rung a model STARTS on: the largest rung that does not exceed its real
- * window. A model below the smallest rung still gets the smallest one —
- * declaring a budget UNDER the real window only costs context (the host
- * compacts earlier), while one over it costs a failed request.
- */
-export function defaultContextTier(realCeiling: number): number {
-  const fitting = CONTEXT_WINDOW_TIERS.filter((tier) => tier <= realCeiling + TIER_FIT_SLACK);
-  // The ladder is ascending, so the largest fitting rung is the LAST one and
-  // the floor is the FIRST one.
-  return fitting[fitting.length - 1] ?? CONTEXT_WINDOW_TIERS[0];
-}
 
 // --- Fixed behavior (no settings — behavior lives in code, not options) ---------
 
@@ -483,35 +674,80 @@ export const THINKING_DISABLE_STYLE: ThinkingDisableStyle = 'none';
 
 /**
  * One position of the THINKING-EFFORT gear — the dropdown the model picker
- * renders from `configurationSchema` (the same non-public contract the
- * official Auto selector and the built-in reasoning-effort dropdown ride on).
+ * renders in its configuration panel.
  *
- * `auto` is the default and sends NOTHING. An arbitrary OpenAI-compatible
- * gateway has no single spelling for "how hard to think" — or even for "do
- * not think" (see {@link THINKING_DISABLE_STYLE}) — so the safe default is to
- * let the gateway's own rule stand. Every other value goes out verbatim as
- * `reasoning_effort`, and a gateway that rejects the parameter has it removed
- * by the 400 ladder (`reasoning_effort` is already one of the optional body
- * params) instead of failing the request.
+ * TWO harnesses read this dropdown, and they do NOT read it the same way:
+ *
+ *   - VS Code's own picker renders `configurationSchema` (group `navigation`);
+ *   - Copilot's harness ignores that schema and builds its own dropdown from
+ *     the TOP-LEVEL `supportsReasoningEffort` / `defaultReasoningEffort`
+ *     fields — and it labels every entry through a FIXED table
+ *     (`none / minimal / low / medium / high / xhigh / max`). A value outside
+ *     that table is DROPPED silently, which is how this extension ended up
+ *     showing five positions in one window and four in the other.
+ *
+ * So the ids ARE the host's words, and both windows then show the same list.
+ * `none` is the position that sends NOTHING: an arbitrary OpenAI-compatible
+ * gateway has no single spelling for "how hard to think" — or even for "do not
+ * think" (see {@link THINKING_DISABLE_STYLE}) — so that position lets the
+ * gateway's own rule stand. `low` / `medium` / `high` go out verbatim as
+ * `reasoning_effort`; `high` is the default. A gateway that rejects the
+ * parameter has it removed by the 400 ladder (`reasoning_effort` is already
+ * one of the optional body params) instead of failing the request.
+ *
+ * Localised wording lives in the panel's `enumItemLabels` (which only VS Code's
+ * picker reads) — NEVER in the id, because the id is what Copilot filters on.
+ *
+ * Deliberate trade-off: `reasoning_effort: "none"` is no longer ever sent. One
+ * of the four visible positions had to carry "send nothing" (the host has no
+ * word for it), and putting it on `none` is the only mapping where the label
+ * still tells the truth. A gateway that needs the literal value to stop
+ * thinking is better served by `low`.
  */
-export type ThinkingEffort = 'auto' | 'none' | 'low' | 'medium' | 'high';
+export type ThinkingEffort = 'none' | 'low' | 'medium' | 'high';
 
-/** Gear positions in dropdown order — the default first. */
-export const THINKING_EFFORTS: readonly ThinkingEffort[] = ['auto', 'none', 'low', 'medium', 'high'];
+/** Gear positions in dropdown order, from no parameter to highest effort. */
+export const THINKING_EFFORTS: readonly ThinkingEffort[] = ['none', 'low', 'medium', 'high'];
 
 /** Position applied when the host sends no (or an unknown) choice. */
-export const DEFAULT_THINKING_EFFORT: ThinkingEffort = 'auto';
+export const DEFAULT_THINKING_EFFORT: ThinkingEffort = 'high';
 
 /**
- * Narrow a gear value: an unknown id (a stale stored value, an older host)
- * falls back to the default instead of failing the request.
+ * The RETIRED id of the no-parameter position: builds before the rungs were
+ * named after the host's words offered `auto`. VS Code keeps the value it
+ * stored, so `auto` has to keep meaning "send nothing" rather than degrading
+ * to whatever the default happens to be.
  */
-export function resolveThinkingEffort(value: string | undefined): ThinkingEffort {
+const RETIRED_NO_PARAM_EFFORT = 'auto';
+
+/**
+ * Narrow a gear value: an unknown id (a stale stored value, an older host, a
+ * position this row does not offer) falls back to the row's default instead of
+ * failing the request.
+ *
+ * `allowed` is the ROW's rung set (see {@link resolveReasoningIds}): a value
+ * the row does not declare must not be sent, because the panel never offered
+ * it and the label the user saw could not have meant it.
+ */
+export function resolveThinkingEffort(
+  value: string | undefined,
+  allowed: readonly ThinkingEffort[] = THINKING_EFFORTS
+): ThinkingEffort {
+  if (allowed.length === 0) {
+    return 'none';
+  }
   const normalized = value?.trim().toLowerCase();
-  return THINKING_EFFORTS.find((effort) => effort === normalized) ?? DEFAULT_THINKING_EFFORT;
+  if (normalized === RETIRED_NO_PARAM_EFFORT) {
+    return allowed.includes('none') ? 'none' : allowed[0];
+  }
+  const member = allowed.find((effort) => effort === normalized);
+  return member ?? (allowed.includes(DEFAULT_THINKING_EFFORT) ? DEFAULT_THINKING_EFFORT : allowed[0]);
 }
 
-/** The `reasoning_effort` value for the wire, or `undefined` for `auto`. */
+/**
+ * The `reasoning_effort` value for the wire, or `undefined` for the position
+ * that asks for nothing.
+ */
 export function thinkingEffortParam(effort: ThinkingEffort): string | undefined {
-  return effort === 'auto' ? undefined : effort;
+  return effort === 'none' ? undefined : effort;
 }

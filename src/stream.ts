@@ -5,8 +5,10 @@
  * usage numbers into the terminal data part Copilot Chat consumes, and maps
  * non-2xx responses / cancellation onto `LanguageModelError`.
  */
+import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { reportThinking } from './thinking';
+import { extractTextToolCalls, mayBeToolCallMarkup, MARKUP_BUFFER_LIMIT } from './toolCallText';
 
 /**
  * Parse the gateway's SSE stream and forward every chunk to VS Code.
@@ -21,11 +23,31 @@ import { reportThinking } from './thinking';
  *
  * `onFirstChunk` fires exactly once, when the first body bytes arrive.
  */
+
+/**
+ * A tool call whose id is in the MODEL's own notation — `functions.edit:12` —
+ * rather than one the gateway generated (`call_7edbe346b1164b09bd2ff1cc`).
+ *
+ * MEASURED (2026-11-05, Agents window, kimi-k2.6 behind a relay): the two id
+ * shapes do not carry the same arguments. Structured calls arrived with all
+ * 3-4 fields; every native-id call arrived with exactly ONE field — the first
+ * — which is how `edit` failed 21 of 22 times with `old_str is required` and
+ * the agent then repeated the identical call 20 times. Same model, same key:
+ * which shape a turn gets is decided upstream, per turn.
+ */
+const NATIVE_TOOL_CALL_ID = /^functions\.[\w.-]+:\d+$/;
+
 export async function streamSseToProgress(
   body: ReadableStream<Uint8Array>,
   progress: vscode.Progress<vscode.LanguageModelResponsePart>,
   token: vscode.CancellationToken,
-  onFirstChunk?: () => void
+  onFirstChunk?: () => void,
+  /**
+   * Required arguments per tool, straight from `LanguageModelChatTool
+   * .inputSchema.required`. A call missing one of them cannot succeed, so it is
+   * dropped rather than dispatched — see the `incomplete` branch in flushToolCall.
+   */
+  requiredByTool?: ReadonlyMap<string, readonly string[]>
 ): Promise<{
   usage?: GatewayUsage;
   completionChars: number;
@@ -33,6 +55,24 @@ export async function streamSseToProgress(
   thinkingReported: boolean;
   /** Full reasoning text of this turn — replayed on the next one (replay.ts). */
   reasoning: string;
+  /**
+   * Health of the tool-call channel for this turn. `textParsed` counts the calls
+   * that did NOT arrive through the structured `tool_calls` field: either the
+   * gateway recovered them from the model's raw TEXT (native id, arguments
+   * usually cut to their first key) or the arguments were not valid JSON at all.
+   * Neither can be repaired here — the missing fields are simply absent — but
+   * one logged line per request is what separates "the model keeps botching
+   * edits" from "this gateway is not parsing tool calls".
+   */
+  toolCalls: {
+    total: number;
+    textParsed: number;
+    /** Calls rescued from markup that arrived as text (toolCallText.ts). */
+    recovered: number;
+    /** Calls dropped because the gateway cut their arguments (name + missing fields). */
+    incomplete: { name: string; missing: string[] }[];
+    samples: string[];
+  };
 }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -47,9 +87,80 @@ export async function streamSseToProgress(
   let thinkingChars = 0;
   let thinkingReported = false;
   let reasoningSoFar = '';
+  // Identity of the reasoning run being streamed right now. The chat model
+  // groups thinking deltas into one "Thought for Ns" block per part id, so the
+  // id must span a whole contiguous burst and must be dropped as soon as text
+  // or a tool call ends that burst — a fresh id per delta renders one block per
+  // delta instead of one block per burst.
+  let thinkingRunId: string | undefined;
   // Accumulating tool calls: chunks arrive as indexed fragments
   // ({index, id?, function: {name?, arguments-fragment}}).
   const pendingToolCalls = new Map<number, { id: string; name: string; args: string }>();
+  // Channel health, handed back to provider.ts and logged there (one line per
+  // request). `samples` is capped: a looping agent can produce dozens.
+  const toolCalls = {
+    total: 0,
+    textParsed: 0,
+    recovered: 0,
+    incomplete: [] as { name: string; missing: string[] }[],
+    samples: [] as string[],
+  };
+  // Text held back because it may be a tool-call block in the model's own
+  // markup (a relay that cannot map native calls leaves it in `content`).
+  // Cleared on the first character that proves the answer is prose.
+  let heldText = '';
+  let textDecided = false;
+
+  /** Forward model text to the host, counting it for the usage estimate. */
+  const emitText = (text: string): void => {
+    if (!text) {
+      return;
+    }
+    completionChars += text.length;
+    progress.report(new vscode.LanguageModelTextPart(text));
+  };
+
+  /**
+   * Text goes straight through UNLESS the answer opens with tool-call markup —
+   * the case where the gateway lost the call entirely. Only the opening
+   * characters are ever held, so streaming latency for prose is unchanged.
+   */
+  const reportText = (chunk: string): void => {
+    thinkingRunId = undefined;
+    if (textDecided) {
+      emitText(chunk);
+      return;
+    }
+    heldText += chunk;
+    if (!mayBeToolCallMarkup(heldText.trimStart())) {
+      textDecided = true;
+      const text = heldText;
+      heldText = '';
+      emitText(text);
+      return;
+    }
+    if (heldText.includes('</tool_call>')) {
+      const { calls, rest } = extractTextToolCalls(heldText);
+      if (calls.length > 0) {
+        textDecided = true;
+        heldText = '';
+        for (const call of calls) {
+          toolCalls.recovered += 1;
+          progress.report(
+            new vscode.LanguageModelToolCallPart(`call_${randomUUID()}`, call.name, call.args)
+          );
+        }
+        emitText(rest.trim());
+        return;
+      }
+    }
+    if (heldText.length > MARKUP_BUFFER_LIMIT) {
+      textDecided = true;
+      const text = heldText;
+      heldText = '';
+      emitText(text);
+    }
+  };
 
   const flushToolCall = (index: number): void => {
     const pending = pendingToolCalls.get(index);
@@ -58,12 +169,39 @@ export async function streamSseToProgress(
     }
     pendingToolCalls.delete(index);
     let input: unknown;
+    let malformed = false;
     try {
       input = pending.args.trim() ? JSON.parse(pending.args) : {};
     } catch {
       // Malformed arguments: hand the raw string over rather than dropping
       // the call — the tool layer will surface the schema error.
       input = { _raw: pending.args };
+      malformed = true;
+    }
+    toolCalls.total += 1;
+    if (malformed || NATIVE_TOOL_CALL_ID.test(pending.id)) {
+      toolCalls.textParsed += 1;
+      if (toolCalls.samples.length < 3) {
+        const keys =
+          !malformed && input !== null && typeof input === 'object'
+            ? Object.keys(input as Record<string, unknown>).join('|') || '-'
+            : 'raw';
+        toolCalls.samples.push(`${pending.name || '?'}(${keys})`);
+      }
+    }
+    // A call that cannot satisfy its own schema is a guaranteed failure. The
+    // host would dispatch it, get `old_str is required`, feed that back, and
+    // the model — seeing its own truncated call in the transcript — repeats it
+    // verbatim (measured: 20 identical attempts, four minutes, no edit). Drop
+    // it instead: the turn ends, and the notice below tells the user why.
+    const required = requiredByTool?.get(pending.name);
+    if (required && required.length > 0) {
+      const present = input !== null && typeof input === 'object' ? (input as Record<string, unknown>) : {};
+      const missing = required.filter((field) => !(field in present));
+      if (missing.length > 0) {
+        toolCalls.incomplete.push({ name: pending.name, missing });
+        return;
+      }
     }
     progress.report(new vscode.LanguageModelToolCallPart(pending.id, pending.name, input as object));
   };
@@ -115,13 +253,14 @@ export async function streamSseToProgress(
       if (reasoning) {
         thinkingChars += reasoning.length;
         reasoningSoFar += reasoning;
-        thinkingReported = reportThinking(reasoning, progress) || thinkingReported;
+        thinkingRunId ??= randomUUID();
+        thinkingReported = reportThinking(reasoning, progress, thinkingRunId) || thinkingReported;
       }
       if (typeof delta.content === 'string' && delta.content.length > 0) {
-        completionChars += delta.content.length;
-        progress.report(new vscode.LanguageModelTextPart(delta.content));
+        reportText(delta.content);
       }
       if (Array.isArray(delta.tool_calls)) {
+        thinkingRunId = undefined;
         for (const call of delta.tool_calls) {
           const index = call.index ?? 0;
           const pending =
@@ -169,7 +308,16 @@ export async function streamSseToProgress(
     for (;;) {
       if (token.isCancellationRequested) {
         await reader.cancel();
-        return { usage, completionChars, thinkingChars, thinkingReported, reasoning: reasoningSoFar };
+        // `toolCalls` is a live object: the flush below still runs and its
+        // counters must reach the caller.
+        return {
+          usage,
+          completionChars,
+          thinkingChars,
+          thinkingReported,
+          reasoning: reasoningSoFar,
+          toolCalls,
+        };
       }
       const { done, value } = await reader.read();
       if (done) {
@@ -193,8 +341,36 @@ export async function streamSseToProgress(
     for (const index of [...pendingToolCalls.keys()].sort((a, b) => a - b)) {
       flushToolCall(index);
     }
+    // Anything still held back was markup we could not parse — show it rather
+    // than swallowing the answer.
+    if (heldText) {
+      const text = heldText;
+      heldText = '';
+      try {
+        emitText(text);
+      } catch {
+        // A dead progress sink must not mask the real error.
+      }
+    }
+    if (toolCalls.incomplete.length > 0) {
+      const detail = toolCalls.incomplete
+        .map((call) => `${call.name} (missing ${call.missing.join(', ')})`)
+        .join('; ');
+      try {
+        progress.report(
+          new vscode.LanguageModelTextPart(
+            vscode.l10n.t(
+              'Dropped an incomplete tool call from the gateway: {0}. Retry, or pick another model — the gateway is truncating tool arguments.',
+              detail
+            )
+          )
+        );
+      } catch {
+        // As above: the diagnostic is not worth failing the turn over.
+      }
+    }
   }
-  return { usage, completionChars, thinkingChars, thinkingReported, reasoning: reasoningSoFar };
+  return { usage, completionChars, thinkingChars, thinkingReported, reasoning: reasoningSoFar, toolCalls };
 }
 
 /**
@@ -272,7 +448,7 @@ export async function readErrorDetail(response: Response, limit = 300): Promise<
 
 /** Map a non-2xx status + sanitized detail onto a LanguageModelError. */
 export function responseErrorWithDetail(status: number, detail: string): vscode.LanguageModelError {
-  const message = `Custom for Copilot Chat gateway HTTP ${status}${detail ? `: ${detail}` : ''}`;
+  const message = `Custom for Copilot gateway HTTP ${status}${detail ? `: ${detail}` : ''}`;
   if (status === 401 || status === 403) {
     return vscode.LanguageModelError.NoPermissions(message);
   }

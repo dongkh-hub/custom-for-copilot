@@ -8,8 +8,11 @@
  */
 import * as vscode from 'vscode';
 
-/** Constructor shape of the proposed thinking part. */
-type ThinkingPartCtor = new (value: string | string[]) => { value: string | string[] };
+/** Constructor shape of the proposed thinking part (second arg = run identity). */
+type ThinkingPartCtor = new (
+  value: string | string[],
+  id?: string
+) => { value: string | string[]; id?: string };
 
 function thinkingPartClass(): ThinkingPartCtor | undefined {
   const candidate = (vscode as unknown as Record<string, unknown>).LanguageModelThinkingPart;
@@ -30,10 +33,17 @@ export function thinkingPartText(part: unknown): string {
  * Forward a reasoning delta. Returns false when the host has no thinking part
  * (older VS Code) — in that case the text is simply not shown; the request
  * itself is unaffected. Passthrough is always on (fixed behavior).
+ *
+ * `runId` is the identity of the reasoning run the delta belongs to. The chat
+ * model keeps deltas in one "Thought for Ns" block while the part id stays the
+ * same and opens a new block when it differs; the renderer stamps an id-less
+ * part with `Date.now()`, which makes every following id-less delta look like a
+ * new run. Callers therefore pass one id per contiguous reasoning burst.
  */
 export function reportThinking(
   text: string,
-  progress: vscode.Progress<vscode.LanguageModelResponsePart>
+  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  runId?: string
 ): boolean {
   const ctor = thinkingPartClass();
   if (!ctor) {
@@ -41,6 +51,6 @@ export function reportThinking(
   }
   // Not in the stable `LanguageModelResponsePart` union — the cast is the same
   // one the proposed API's own consumers use.
-  progress.report(new ctor(text) as unknown as vscode.LanguageModelResponsePart);
+  progress.report(new ctor(text, runId) as unknown as vscode.LanguageModelResponsePart);
   return true;
 }

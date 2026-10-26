@@ -1,9 +1,9 @@
 {
-  "name": "custom-for-copilot-chat",
-  "displayName": "Custom for Copilot Chat",
+  "name": "custom-for-copilot",
+  "displayName": "Custom for Copilot",
   "description": "%extension.description%",
-  "version": "0.1.0",
-  "publisher": "bCloudCopilotTools",
+  "version": "0.1.1",
+  "publisher": "CustomforCopilot",
   "license": "MIT",
   "icon": "icon.png",
   "repository": {
@@ -42,6 +42,11 @@
         "command": "customModel.resetCapabilities",
         "title": "%cmd.resetCapabilities.title%",
         "category": "%command.category%"
+      },
+      {
+        "command": "customModel.syncToCopilot",
+        "title": "%cmd.syncToCopilot.title%",
+        "category": "%command.category%"
       }
     ],
     "configuration": {
@@ -70,6 +75,7 @@
     "verify": "npm run compile && npm run i18n:check && node scripts/smoke.js && node scripts/capability-e2e.js",
     "vscode:prepublish": "npm run compile",
     "package": "vsce package --skip-license",
+    "package:next": "npm run verify && npm version ${npm_config_bump:-patch} --no-git-tag-version && npm run package",
     "sync:release-version": "node scripts/sync-release-version.js",
     "e2e": "node scripts/capability-e2e.js"
   },

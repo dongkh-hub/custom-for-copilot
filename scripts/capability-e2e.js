@@ -55,6 +55,8 @@ const secretStorage = {
   onDidChange: () => ({ dispose() {} }),
 };
 let captured;
+/** Everything the extension would print in its visible Output channel. */
+const channelLines = [];
 const vscodeStub = {
   version: '1.999.0-e2e',
   LanguageModelChatMessageRole: { User: 1, Assistant: 2 },
@@ -77,7 +79,9 @@ const vscodeStub = {
     fire() { for (const fn of this.listeners) fn(); }
   },
   window: {
-    createOutputChannel: () => ({ appendLine() {}, append() {} }),
+    // Lines written to the visible channel are kept: a diagnostic the user is
+    // told to look at ("Output → Custom for Copilot") has to be assertable.
+    createOutputChannel: () => ({ appendLine: (line) => channelLines.push(line), append() {} }),
     showInformationMessage: () => undefined,
   },
   workspace: {
@@ -97,6 +101,9 @@ const seen = [];
 // Authorization header per request — a keyless gateway must receive NONE.
 const authSeen = [];
 let genericBody = false;
+// Terminal answer for the SUCCESS branch, when a case needs a shape other than
+// a plain "ok" text delta (a tool call, a reasoning-only turn…).
+let sseBody = null;
 const server = http.createServer((req, res) => {
   let raw = '';
   req.on('data', (chunk) => { raw += chunk; });
@@ -119,6 +126,11 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    if (sseBody) {
+      res.write(sseBody);
+      res.end();
+      return;
+    }
     res.write('data: {"id":"x","choices":[{"delta":{"content":"ok"}}]}\n\n');
     res.write('data: {"id":"x","choices":[{"finish_reason":"stop","delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":1}}\n\n');
     res.write('data: [DONE]\n\n');
@@ -184,11 +196,29 @@ const server = http.createServer((req, res) => {
   assert.ok(/"high"/.test(schema.enumDescriptions[mediumIndex]), 'description names the substitute');
   console.log('PASS 3 — panel note:', schema.enumDescriptions[mediumIndex]);
 
-  // 4) A value the enumeration rejected is also skipped without a round-trip.
+  // 3b) BOTH harnesses must read the SAME positions. VS Code's picker renders
+  //     `configurationSchema`; Copilot ignores it and rebuilds the dropdown from
+  //     `supportsReasoningEffort` / `defaultReasoningEffort`, labelling only the
+  //     words it knows. A window control is absent because only one of the two
+  //     harnesses renders the `tokens` group.
+  const positions = ['none', 'low', 'medium', 'high'];
+  assert.deepStrictEqual([...schema.enum], positions, `schema enum: ${schema.enum}`);
+  assert.strictEqual(schema.default, 'high', 'the default is the highest effort');
+  assert.deepStrictEqual([...infos[0].supportsReasoningEffort], positions, 'Copilot gets the same four');
+  assert.strictEqual(infos[0].defaultReasoningEffort, 'high');
+  assert.strictEqual(
+    infos[0].configurationSchema.properties.contextSize,
+    undefined,
+    'a row with ONE window has no context control'
+  );
+  console.log('PASS 3b — both harnesses get the same four positions and the high default');
+
+  // 4) The no-parameter position reaches the wire as NOTHING — it is the one
+  //    position no gateway can reject.
   seen.length = 0;
   await ask('none');
-  assert.deepStrictEqual(seen, ['high'], `none was never tried, got ${JSON.stringify(seen)}`);
-  console.log('PASS 4 — enumerated-but-missing value skipped, sent:', seen[0]);
+  assert.deepStrictEqual(seen, [undefined], `none must send no reasoning_effort, got ${JSON.stringify(seen)}`);
+  console.log('PASS 4 — the no-parameter position sends nothing on the wire');
 
   // 5) A GENERIC error body (no field named) is still attributable: the probe
   //    differs by one parameter, so the conclusion holds without the body's
@@ -235,6 +265,228 @@ const server = http.createServer((req, res) => {
   const keyless = (await captured.provideLanguageModelChatInformation({}, token))[0];
   assert.strictEqual(keyless.statusIcon, undefined, 'keyless endpoint is configured, not flagged');
   console.log('PASS 6 — keyless endpoint served with no Authorization header');
+
+  // 7) A row that offers SEVERAL windows and a SUBSET of effort positions: the
+  //    model panel gets BOTH controls, the declared window is pre-selected, and
+  //    neither host is offered a position the row never declared.
+  genericBody = false;
+  await store.writeProfiles([
+    {
+      key: 'p5',
+      name: '分档',
+      baseURL,
+      model: 'm5',
+      maxInputTokens: 380928,
+      maxOutputTokens: 131072,
+      windowInputs: [124928, 380928, 868928],
+      reasoningIds: ['low', 'high'],
+      defaultThinkingEffort: 'high',
+    },
+  ]);
+  secrets.set(cfg.apiKeySecretKey('p5'), 'sk-test');
+  const wide = (await captured.provideLanguageModelChatInformation({}, token))[0];
+  const props = wide.configurationSchema.properties;
+  assert.deepStrictEqual(props.contextSize.enum, [124928, 380928, 868928], 'the rungs are the input budgets');
+  assert.deepStrictEqual(
+    props.contextSize.enumItemLabels,
+    ['256K', '512K', '1M'],
+    'each label is the TOTAL window the host ring will show'
+  );
+  assert.strictEqual(props.contextSize.default, 380928, 'the declaration is pre-selected');
+  assert.strictEqual(props.contextSize.group, 'tokens');
+  assert.deepStrictEqual(props.reasoningEffort.enum, ['low', 'high'], 'the panel shows the declared subset');
+  assert.strictEqual(props.reasoningEffort.default, 'high');
+  assert.deepStrictEqual([...wide.supportsReasoningEffort], ['low', 'high'], 'Copilot gets the same subset');
+  assert.strictEqual(wide.defaultReasoningEffort, 'high');
+  assert.strictEqual(wide.maxInputTokens, 380928, 'the declaration is still the one number every harness reads');
+
+  // A position the row never declared must not reach the wire — the host can
+  // still hold an older pick in its per-model storage.
+  seen.length = 0;
+  await captured.provideLanguageModelChatResponse(
+    { id: 'p5::m5' },
+    messages,
+    { modelOptions: { reasoningEffort: 'medium' }, tools: [] },
+    { report: () => undefined },
+    token
+  );
+  assert.deepStrictEqual(seen, ['high'], `undeclared position replaced by the row default, got ${JSON.stringify(seen)}`);
+  console.log('PASS 7 — window rungs + effort subset:', JSON.stringify(props.contextSize.enumItemLabels), props.reasoningEffort.enum.join('/'));
+
+  // A row that declares NO effort position (a gateway that rejects the
+  // parameter) must offer no control at all — not a one-item dropdown.
+  await store.writeProfiles([
+    {
+      key: 'p6',
+      name: '无档',
+      baseURL,
+      model: 'm6',
+      maxInputTokens: 0,
+      maxOutputTokens: 0,
+      reasoningIds: [],
+    },
+  ]);
+  secrets.set(cfg.apiKeySecretKey('p6'), 'sk-test');
+  const bare = (await captured.provideLanguageModelChatInformation({}, token))[0];
+  assert.strictEqual(bare.configurationSchema, undefined, 'no control to render');
+  assert.strictEqual(bare.supportsReasoningEffort, undefined, 'Copilot gets no dropdown either');
+  console.log('PASS 8 — no effort rung = no control anywhere');
+
+  // 9) A gateway that recovers tool calls from the model's TEXT: the id stays in
+  //    the model's own notation (`functions.edit:12`) and the arguments kept
+  //    only their FIRST key. The call must still be forwarded — nothing here can
+  //    invent the missing fields — and the turn must be reported on the visible
+  //    channel, which is what turns "the agent keeps failing at edit" into
+  //    "this gateway is not parsing tool calls".
+  await store.writeProfiles([
+    { key: 'p7', name: '降级通道', baseURL, model: 'm7', maxInputTokens: 0, maxOutputTokens: 0 },
+  ]);
+  secrets.set(cfg.apiKeySecretKey('p7'), 'sk-test');
+  sseBody = `${[
+    {
+      id: 'x',
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: 'functions.edit:12',
+                type: 'function',
+                function: { name: 'edit', arguments: '{"path":"/tmp/a.json"}' },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    { id: 'x', choices: [{ finish_reason: 'tool_calls', delta: {} }] },
+  ]
+    .map((chunk) => `data: ${JSON.stringify(chunk)}`)
+    .join('\n\n')}\n\ndata: [DONE]\n\n`;
+  channelLines.length = 0;
+  const parts = [];
+  await captured.provideLanguageModelChatResponse(
+    { id: 'p7::m7' },
+    messages,
+    { modelOptions: {}, tools: [] },
+    { report: (part) => parts.push(part) },
+    token
+  );
+  sseBody = null;
+  const degradedCall = parts.find((part) => part instanceof LanguageModelToolCallPart);
+  assert.ok(degradedCall, 'the degraded call is still handed to the host');
+  assert.deepStrictEqual(degradedCall.input, { path: '/tmp/a.json' }, 'arguments pass through untouched');
+  assert.ok(
+    channelLines.some(
+      (line) =>
+        line.includes('response.toolshape') &&
+        line.includes('degraded=1/1') &&
+        line.includes('edit(path)')
+    ),
+    `degraded channel must reach the visible output: ${JSON.stringify(channelLines.slice(-2))}`
+  );
+  console.log('PASS 9 — text-parsed tool call flagged as degraded: edit(path)');
+
+  // 10) A call that arrived as MARKUP in `content` (the gateway lost the
+  //     structured field entirely). The extension parses the blocks back into a
+  //     real tool call — the alternative is a wasted turn: the host runs
+  //     nothing, the model sees no result, the user sees raw tags.
+  await store.writeProfiles([
+    { key: 'p8', name: '标记回填', baseURL, model: 'm8', maxInputTokens: 0, maxOutputTokens: 0 },
+  ]);
+  secrets.set(cfg.apiKeySecretKey('p8'), 'sk-test');
+  const markup =
+    '\n\n<tool_call>\n<function=edit>\n<parameter=path>\n/tmp/a.json\n</parameter>\n' +
+    '<parameter=old_str>\n"a"\n</parameter>\n<parameter=new_str>\n"b"\n</parameter>\n</function>\n</tool_call>';
+  sseBody = `data: ${JSON.stringify({ id: 'x', choices: [{ delta: { content: markup } }] })}\n\ndata: [DONE]\n\n`;
+  channelLines.length = 0;
+  const markupParts = [];
+  await captured.provideLanguageModelChatResponse(
+    { id: 'p8::m8' },
+    messages,
+    { modelOptions: {}, tools: [] },
+    { report: (part) => markupParts.push(part) },
+    token
+  );
+  sseBody = null;
+  const rescued = markupParts.find((part) => part instanceof LanguageModelToolCallPart);
+  assert.ok(rescued, 'markup is turned back into a tool call');
+  assert.strictEqual(rescued.name, 'edit');
+  assert.deepStrictEqual(
+    rescued.input,
+    { path: '/tmp/a.json', old_str: '"a"', new_str: '"b"' },
+    'every <parameter> is kept, values unwrapped from the tag layout'
+  );
+  assert.ok(
+    !markupParts.some((part) => part instanceof LanguageModelTextPart && part.value.includes('<tool_call')),
+    'the raw markup never reaches the user'
+  );
+  assert.ok(
+    channelLines.some((line) => line.includes('response.toolshape') && line.includes('recovered=1')),
+    `recovery reported: ${JSON.stringify(channelLines.slice(-2))}`
+  );
+  console.log('PASS 10 — markup in content rescued into a complete edit call');
+
+  // 11) A call the gateway cut down to ONE argument. It can never satisfy its
+  //     schema, so dispatching it only buys a failure the model then repeats.
+  //     Dropped, with one visible line instead of a silent loop.
+  const editTool = {
+    name: 'edit',
+    description: 'Replace a string in a file',
+    inputSchema: {
+      type: 'object',
+      properties: { path: { type: 'string' }, old_str: { type: 'string' }, new_str: { type: 'string' } },
+      required: ['path', 'old_str', 'new_str'],
+    },
+  };
+  sseBody = `data: ${JSON.stringify({
+    id: 'x',
+    choices: [
+      {
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              id: 'functions.edit:12',
+              type: 'function',
+              function: { name: 'edit', arguments: '{"path":"/tmp/a.json"}' },
+            },
+          ],
+        },
+      },
+    ],
+  })}\n\ndata: [DONE]\n\n`;
+  channelLines.length = 0;
+  const droppedParts = [];
+  await captured.provideLanguageModelChatResponse(
+    { id: 'p8::m8' },
+    messages,
+    { modelOptions: {}, tools: [editTool] },
+    { report: (part) => droppedParts.push(part) },
+    token
+  );
+  sseBody = null;
+  assert.ok(
+    !droppedParts.some((part) => part instanceof LanguageModelToolCallPart),
+    'an impossible call is never dispatched'
+  );
+  assert.ok(
+    droppedParts.some(
+      (part) =>
+        part instanceof LanguageModelTextPart &&
+        part.value.includes('Dropped an incomplete tool call') &&
+        part.value.includes('old_str')
+    ),
+    `the user is told what happened: ${JSON.stringify(droppedParts.map((p) => p.value).filter(Boolean))}`
+  );
+  assert.ok(
+    channelLines.some(
+      (line) => line.includes('response.toolshape') && line.includes('dropped=edit(old_str|new_str)')
+    ),
+    `drop reported: ${JSON.stringify(channelLines.slice(-2))}`
+  );
+  console.log('PASS 11 — incomplete call dropped with one visible notice, not a retry loop');
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });

@@ -13,7 +13,7 @@
  *
  *   `chat.agentHost.allowSignedOutWhenUsable` = true
  *   `chat.agentHost.byokModels.enabled`       = true
- *   `extensions.supportAgentsWindow`          = { "CustomforCopilotChat.custom-for-copilot-chat": true }
+ *   `extensions.supportAgentsWindow`          = { "CustomforCopilot.custom-for-copilot": true }
  *
  * The third one is the load gate: a manifest that ships `main`/`browser` runs
  * in that window only when the user's allow-list names the extension, and a

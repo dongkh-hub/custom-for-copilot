@@ -18,7 +18,14 @@
  */
 import * as vscode from 'vscode';
 import {
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  DEFAULT_THINKING_EFFORT,
+  MODEL_WINDOW_TIERS,
   STATE_KEYS,
+  THINKING_EFFORTS,
+  customWindowTier,
+  detectModelPreset,
+  hostWindowLabel,
   newProfileKey,
   normalizeBaseURL,
   profileHasCredentials,
@@ -27,8 +34,11 @@ import {
   summaryInputTokens,
   summaryWindowLabel,
   tokenWindowLabel,
+  windowCandidates,
   writeProfileApiKey,
+  type ModelWindowTier,
   type Profile,
+  type ThinkingEffort,
 } from './config';
 import { readProfiles, removeProfile, upsertProfile } from './profileStore';
 import {
@@ -36,7 +46,7 @@ import {
   openCopilotChatExtension,
   waitUntilCopilotChatAvailable,
 } from './copilotChat';
-import { notifyProviderChanged } from './provider';
+import { effortDescription, effortLabel, notifyProviderChanged } from './provider';
 import { defaultChatUtilitySettingsToOwnModel } from './hostDefaults';
 
 /**
@@ -90,8 +100,8 @@ function isUsableBaseURL(baseURL: string): boolean {
  */
 function entryLimitsLabel(profile: Profile): string {
   const entry = resolveProfileEntry(profile);
-  // The real ceiling, not the starting rung — a preset label like
-  // "Beta V4 (1M/128K)" describes what the model can do.
+  // The model's real ceiling — a preset label like "Beta V4 (1M/128K)"
+  // describes what the model can do.
   const limits = `${summaryWindowLabel(summaryInputTokens(profile))}/${tokenWindowLabel(entry.maxOutputTokens)}`;
   return entry.presetLabel ?? vscode.l10n.t('default {0}', limits);
 }
@@ -107,12 +117,12 @@ function entrySummaryLine(profile: Profile): string {
 /**
  * Remove ONE profile (its SecretStorage key included). Two taps: the manager's
  * remove action, then a modal confirmation — deleting a credential by accident
- * is not recoverable.
+ * is not recoverable. Returns whether the row was actually removed.
  */
 async function confirmAndRemoveProfile(
   context: vscode.ExtensionContext,
   profile: Profile
-): Promise<void> {
+): Promise<boolean> {
   const label = profile.name || profile.model;
   const remove = vscode.l10n.t('Remove');
   const confirmed = await vscode.window.showWarningMessage(
@@ -121,7 +131,7 @@ async function confirmAndRemoveProfile(
     remove
   );
   if (confirmed !== remove) {
-    return;
+    return false;
   }
   await removeProfile(profile.key);
   await writeProfileApiKey(context, profile.key, '');
@@ -130,6 +140,7 @@ async function confirmAndRemoveProfile(
   // first remaining one (fill-only otherwise).
   await defaultChatUtilitySettingsToOwnModel();
   void vscode.window.showInformationMessage(vscode.l10n.t('Removed {0}.', label));
+  return true;
 }
 
 /**
@@ -169,7 +180,7 @@ export async function addModelProfile(context: vscode.ExtensionContext): Promise
 }
 
 /** What picking a group in the manager offers. */
-type ManageAction = 'update' | 'duplicate' | 'remove';
+type ManageAction = 'update' | 'window' | 'effort' | 'duplicate' | 'remove';
 
 /** One row of the manager list: a configured group, or the trailing "add". */
 type ManageItem = vscode.QuickPickItem & { profile?: Profile; add?: boolean };
@@ -183,9 +194,11 @@ type ManageItem = vscode.QuickPickItem & { profile?: Profile; add?: boolean };
  * facts the settings mirror shows (alias, model id, limits, ⚠ key state) —
  * and the affordances live one level down: picking a group opens the action
  * menu (update model ID / duplicate / remove), Esc there falls back to the
- * list, and those actions re-open it so several groups can be tended in one
- * visit. The LAST row is always "add", pinned with `alwaysShow`, so the list
- * only ever grows by appending.
+ * list, and a COMPLETED action closes the manager outright — the user came
+ * to tend one group, and re-opening the list would only cover the toast they
+ * are reading. A cancelled or failed action falls back to the list, where
+ * the group can be picked again. The LAST row is always "add", pinned with
+ * `alwaysShow`, so the list only ever grows by appending.
  *
  * ADDING is the one action that ENDS the visit: the wizard hands focus to
  * Copilot Chat, and re-opening the list afterwards would put the picker back
@@ -257,12 +270,23 @@ export async function manageModels(context: vscode.ExtensionContext): Promise<vo
     if (!action) {
       continue; // Esc at the action menu → back to the list
     }
+    let done: boolean;
     if (action === 'update') {
-      await updateModelIdFlow(picked.profile);
+      done = await updateModelIdFlow(picked.profile);
+    } else if (action === 'window') {
+      done = await editWindowFlow(picked.profile);
+    } else if (action === 'effort') {
+      done = await editEffortFlow(picked.profile);
     } else if (action === 'duplicate') {
-      await duplicateModelFlow(context, picked.profile);
+      done = await duplicateModelFlow(context, picked.profile);
     } else {
-      await confirmAndRemoveProfile(context, picked.profile);
+      done = await confirmAndRemoveProfile(context, picked.profile);
+    }
+    if (done) {
+      // A COMPLETED action ends the visit: the change is stored and its toast
+      // is up — re-opening the list would only cover it. A cancelled or
+      // failed one loops back to the list instead.
+      return;
     }
   }
 }
@@ -278,6 +302,22 @@ async function pickManageAction(profile: Profile): Promise<ManageAction | undefi
         label: vscode.l10n.t('$(edit) Update model ID…'),
         description: vscode.l10n.t('The endpoint, alias and API key are kept.'),
         value: 'update' as const,
+      },
+      {
+        label: vscode.l10n.t('$(symbol-ruler) Context window…'),
+        description: windowDetail(profile),
+        detail: vscode.l10n.t(
+          'Tick the windows this model may be used at, then the one it declares.'
+        ),
+        value: 'window' as const,
+      },
+      {
+        label: vscode.l10n.t('$(lightbulb) Effort levels…'),
+        description: effortDetail(profile),
+        detail: vscode.l10n.t(
+          'Tick the positions this gateway accepts, then the one it defaults to.'
+        ),
+        value: 'effort' as const,
       },
       {
         label: vscode.l10n.t('$(copy) Duplicate model…'),
@@ -300,6 +340,370 @@ async function pickManageAction(profile: Profile): Promise<ManageAction | undefi
   return picked?.value;
 }
 
+// --- Rung pickers: what a row may be used at, and what it declares ------------
+//
+// Two dimensions, one shape: tick the rungs the model may be used at, then pick
+// the one it DECLARES. The declaration is what a harness without the model
+// panel applies, so it can never be implied by the ticks alone — and the panel
+// default has to equal it (the host drops a stored value equal to the default).
+
+/** The windows picked for one row. */
+interface WindowPicked {
+  /** Input budgets offered, ascending. Empty = one window, no control. */
+  readonly inputs: number[];
+  /** The rung the row DECLARES (0 = let the preset chain decide). */
+  readonly declared: number;
+}
+
+/** The effort positions picked for one row. */
+interface EffortPicked {
+  /** Empty = this gateway takes no `reasoning_effort` at all. */
+  readonly ids: ThinkingEffort[];
+  readonly defaultId?: ThinkingEffort;
+}
+
+/** One selectable rung. */
+interface RungItem<T> extends vscode.QuickPickItem {
+  readonly value: T;
+}
+
+/**
+ * Multi-select rung picker.
+ *
+ * `createQuickPick` (not `showQuickPick`) because pre-checking the current set
+ * needs the handle. `onDidAccept` fires before the closing `onDidHide`, so an
+ * accept wins over the dismiss; Esc resolves `undefined` and the caller treats
+ * it as "no change".
+ */
+async function pickRungs<T>(
+  items: RungItem<T>[],
+  title: string,
+  placeHolder: string,
+  preselected: readonly RungItem<T>[]
+): Promise<T[] | undefined> {
+  const quickPick = vscode.window.createQuickPick<RungItem<T>>();
+  quickPick.items = items;
+  quickPick.canSelectMany = true;
+  quickPick.title = title;
+  quickPick.placeholder = placeHolder;
+  quickPick.ignoreFocusOut = true;
+  quickPick.selectedItems = items.filter((item) => preselected.includes(item));
+  quickPick.show();
+  const picked = await new Promise<RungItem<T>[] | undefined>((resolve) => {
+    quickPick.onDidAccept(() => resolve([...quickPick.selectedItems]));
+    quickPick.onDidHide(() => resolve(undefined));
+  });
+  quickPick.dispose();
+  return picked?.map((item) => item.value);
+}
+
+/** Single-select rung picker (the "which one is the default" step). */
+async function pickRung<T>(
+  items: RungItem<T>[],
+  title: string,
+  placeHolder: string,
+  active: RungItem<T> | undefined
+): Promise<T | undefined> {
+  const quickPick = vscode.window.createQuickPick<RungItem<T>>();
+  quickPick.items = items;
+  quickPick.canSelectMany = false;
+  quickPick.title = title;
+  quickPick.placeholder = placeHolder;
+  quickPick.ignoreFocusOut = true;
+  quickPick.activeItems = active ? [active] : [];
+  quickPick.show();
+  const picked = await new Promise<RungItem<T>[] | undefined>((resolve) => {
+    quickPick.onDidAccept(() => resolve([...quickPick.activeItems]));
+    quickPick.onDidHide(() => resolve(undefined));
+  });
+  quickPick.dispose();
+  return picked?.[0]?.value;
+}
+
+/** The multi-select sentinel of the「自定义…」row (real budgets are > 0). */
+const CUSTOM_WINDOW = -1;
+
+/**
+ * Ask which WINDOWS the row may be used at, then which one it declares.
+ *
+ * The list is the NAMED windows rebased onto this row's answer reserve (see
+ * `windowCandidates`) plus the rungs the row already carries, so an edit never
+ * silently drops a budget that was typed in earlier. Anything else is the
+ * 「自定义…」 row: one raw input budget, labelled by the total the ring will
+ * show — the same rule as the named rungs, and the reason the list carries no
+ * ceiling-derived entry like `1.1M` for a 1M model.
+ *
+ * The declared window is the row's `maxInputTokens`, so the pre-selection is
+ * the rung it already declares; a NEW row starts on the largest named window,
+ * i.e. the one that fills the model as far as its answer reserve allows.
+ *
+ * Unticking everything is a valid answer: one window, no control. Esc is not.
+ */
+async function pickWindowTiers(
+  model: string,
+  outputTokens: number,
+  prefill?: { inputs?: readonly number[]; declared?: number }
+): Promise<WindowPicked | undefined> {
+  const known = new Map<number, ModelWindowTier>();
+  for (const tier of windowCandidates(model, outputTokens)) {
+    known.set(tier.maxInputTokens, tier);
+  }
+  for (const input of prefill?.inputs ?? []) {
+    if (!known.has(input)) {
+      known.set(input, customWindowTier(input, outputTokens));
+    }
+  }
+  const tiers = [...known.values()].sort((a, b) => a.maxInputTokens - b.maxInputTokens);
+  const checked = new Set<number>(
+    prefill?.inputs ??
+      [prefill?.declared ?? tiers[tiers.length - 1]?.maxInputTokens].filter(
+        (input): input is number => typeof input === 'number' && input > 0
+      )
+  );
+  const label = (input: number): string =>
+    known.get(input)?.label ?? hostWindowLabel(input + outputTokens);
+  const rungDescription = (input: number): string =>
+    vscode.l10n.t(
+      'declares {0} input tokens · {1} reserved for the answer',
+      String(input),
+      String(outputTokens)
+    );
+  const items: RungItem<number>[] = tiers.map((tier) => ({
+    label: tier.label,
+    description: rungDescription(tier.maxInputTokens),
+    value: tier.maxInputTokens,
+  }));
+  items.push({
+    label: vscode.l10n.t('Custom…'),
+    description: vscode.l10n.t('Type an input budget in tokens'),
+    value: CUSTOM_WINDOW,
+  });
+  const picked = await pickRungs(
+    items,
+    vscode.l10n.t('Context window — which windows may this model be used at?'),
+    vscode.l10n.t('Tick the windows to offer in the model panel — none = one window only'),
+    items.filter((item) => checked.has(item.value))
+  );
+  if (!picked) {
+    return undefined;
+  }
+  const inputs = new Set<number>(picked.filter((value) => value > 0));
+  if (picked.includes(CUSTOM_WINDOW)) {
+    const typed = await promptForCustomWindow(outputTokens, prefill?.declared);
+    if (typed === undefined) {
+      return undefined;
+    }
+    inputs.add(typed);
+  }
+  if (inputs.size === 0) {
+    return { inputs: [], declared: prefill?.declared ?? 0 };
+  }
+  const budgets = [...inputs].sort((a, b) => a - b);
+  if (budgets.length === 1) {
+    return { inputs: budgets, declared: budgets[0] };
+  }
+  const wanted = prefill?.declared;
+  const defaultItems: RungItem<number>[] = budgets.map((input) => ({
+    label: label(input),
+    description: rungDescription(input),
+    value: input,
+  }));
+  const active = defaultItems.find((item) => item.value === wanted) ?? defaultItems[defaultItems.length - 1];
+  const declared = await pickRung(
+    defaultItems,
+    vscode.l10n.t('Context window — which one does the model declare?'),
+    vscode.l10n.t('The declared window is what Copilot sizes the session against'),
+    active
+  );
+  if (declared === undefined) {
+    return undefined;
+  }
+  return { inputs: budgets, declared };
+}
+
+/**
+ * The 「自定义…」 box: one raw INPUT budget.
+ *
+ * The prompt states the total the ring will show for what is being typed, so
+ * the number on the panel never comes as a surprise — the label is the total,
+ * and the total is input + the row's answer reserve.
+ */
+async function promptForCustomWindow(
+  outputTokens: number,
+  declared?: number
+): Promise<number | undefined> {
+  const typed = await vscode.window.showInputBox({
+    title: vscode.l10n.t('Custom context window — input budget'),
+    value: declared && declared > 0 ? String(declared) : '',
+    placeHolder: String(MODEL_WINDOW_TIERS[MODEL_WINDOW_TIERS.length - 1].maxInputTokens),
+    ignoreFocusOut: true,
+    prompt: vscode.l10n.t(
+      'Prompt budget in tokens. The context ring will show this plus the {0} reserved for the answer.',
+      String(outputTokens)
+    ),
+    validateInput: (value) => {
+      const tokens = Number(value);
+      if (!Number.isInteger(tokens) || tokens <= 0) {
+        return vscode.l10n.t('Whole tokens only — a positive number.');
+      }
+      return undefined;
+    },
+  });
+  if (typed === undefined) {
+    return undefined;
+  }
+  const tokens = Number(typed);
+  return Number.isInteger(tokens) && tokens > 0 ? tokens : undefined;
+}
+
+/**
+ * Ask which EFFORT positions the row offers, then which one it pre-selects.
+ *
+ * Same reason for two steps as the window: the panel's dropdown lists what the
+ * row declares, and the pre-selected position is what a request uses before
+ * anyone touches it. Every id stays a word both hosts can label (see
+ * THINKING_EFFORTS).
+ *
+ * Nothing ticked is a real answer — the gateway rejects `reasoning_effort`, so
+ * the row offers no control at all.
+ */
+async function pickEffortTiers(prefill?: {
+  ids?: readonly ThinkingEffort[];
+  defaultId?: ThinkingEffort;
+}): Promise<EffortPicked | undefined> {
+  const checked = new Set<ThinkingEffort>(prefill?.ids ?? THINKING_EFFORTS);
+  const items: RungItem<ThinkingEffort>[] = THINKING_EFFORTS.map((effort) => ({
+    label: effortLabel(effort),
+    description: effortDescription(effort),
+    value: effort,
+  }));
+  const picked = await pickRungs(
+    items,
+    vscode.l10n.t('Effort levels — which positions does this gateway accept?'),
+    vscode.l10n.t(
+      'Tick the positions to offer in the model panel — none = never send reasoning_effort'
+    ),
+    items.filter((item) => checked.has(item.value))
+  );
+  if (!picked) {
+    return undefined;
+  }
+  if (picked.length === 0) {
+    return { ids: [] };
+  }
+  // Table order, not click order: the dropdown has to read like every other
+  // row's.
+  const ids = THINKING_EFFORTS.filter((effort) => picked.includes(effort));
+  if (ids.length === 1) {
+    return { ids, defaultId: ids[0] };
+  }
+  const wanted = prefill?.defaultId ?? DEFAULT_THINKING_EFFORT;
+  const activeId = ids.includes(wanted) ? wanted : ids[ids.length - 1];
+  const active = items.find((item) => item.value === activeId);
+  const chosen = await pickRung(
+    items.filter((item) => ids.includes(item.value)),
+    vscode.l10n.t('Effort levels — which one is the default?'),
+    vscode.l10n.t('A request with no pick from the panel sends this position'),
+    active
+  );
+  if (!chosen) {
+    return undefined;
+  }
+  return { ids, defaultId: chosen };
+}
+
+/** Persist one row's rung sets and tell the host to re-query the picker. */
+async function persistTiers(
+  profile: Profile,
+  patch: Partial<
+    Pick<Profile, 'maxInputTokens' | 'windowInputs' | 'reasoningIds' | 'defaultThinkingEffort'>
+  >,
+  message: string
+): Promise<void> {
+  // A field set to `undefined` is DROPPED by the stored JSON, which is exactly
+  // how a retracted rung set goes back to "one window" / "every position".
+  await upsertProfile({ ...profile, ...patch });
+  notifyProviderChanged();
+  void vscode.window.showInformationMessage(message);
+}
+
+/** `修改上下文窗口`: same two-step picker, on an existing row. */
+async function editWindowFlow(profile: Profile): Promise<boolean> {
+  const entry = resolveProfileEntry(profile);
+  const picked = await pickWindowTiers(profile.model, entry.maxOutputTokens, {
+    inputs: profile.windowInputs ?? [entry.maxInputTokens],
+    declared: entry.maxInputTokens,
+  });
+  if (!picked) {
+    return false;
+  }
+  const label = profile.name || profile.model;
+  // Labels are TOTALS (input + the row's answer reserve) — the same arithmetic
+  // the panel and the context ring use, never the raw input budget.
+  const total = (input: number): string => hostWindowLabel(input + entry.maxOutputTokens);
+  await persistTiers(
+    profile,
+    {
+      maxInputTokens: picked.declared,
+      windowInputs: picked.inputs.length > 1 ? picked.inputs : undefined,
+    },
+    picked.inputs.length > 1
+      ? vscode.l10n.t(
+          '{0}: windows {1}, declaring {2}.',
+          label,
+          picked.inputs.map(total).join(' / '),
+          total(picked.declared)
+        )
+      : vscode.l10n.t('{0}: one window ({1}).', label, total(picked.declared))
+  );
+  return true;
+}
+
+/** `修改思考档位`: same two-step picker, on an existing row. */
+async function editEffortFlow(profile: Profile): Promise<boolean> {
+  const entry = resolveProfileEntry(profile);
+  const picked = await pickEffortTiers({
+    ids: entry.reasoningEfforts,
+    defaultId: entry.defaultThinkingEffort,
+  });
+  if (!picked) {
+    return false;
+  }
+  const label = profile.name || profile.model;
+  await persistTiers(
+    profile,
+    {
+      reasoningIds: picked.ids,
+      defaultThinkingEffort: picked.defaultId,
+    },
+    picked.ids.length
+      ? vscode.l10n.t(
+          '{0}: effort {1}, default {2}.',
+          label,
+          picked.ids.map((id) => effortLabel(id)).join(' / '),
+          effortLabel(picked.defaultId ?? picked.ids[0])
+        )
+      : vscode.l10n.t('{0}: no effort control (the gateway decides).', label)
+  );
+  return true;
+}
+
+/** One line for the manager: the windows a row offers, or just its window. */
+function windowDetail(profile: Profile): string {
+  const entry = resolveProfileEntry(profile);
+  return entry.contextTiers?.length
+    ? entry.contextTiers.map((tier) => tier.label).join(' · ')
+    : hostWindowLabel(entry.maxInputTokens + entry.maxOutputTokens);
+}
+
+/** One line for the manager: the effort positions a row offers. */
+function effortDetail(profile: Profile): string {
+  const efforts = resolveProfileEntry(profile).reasoningEfforts;
+  return efforts.length
+    ? efforts.map((effort) => effortLabel(effort)).join(' · ')
+    : vscode.l10n.t('None — the gateway decides');
+}
+
 /**
  * Duplicate ONE group onto a fresh row: the base URL and the API key are
  * copied, the alias and the model ID are asked for. The case is the provider
@@ -316,7 +720,7 @@ async function pickManageAction(profile: Profile): Promise<ManageAction | undefi
 async function duplicateModelFlow(
   context: vscode.ExtensionContext,
   profile: Profile
-): Promise<void> {
+): Promise<boolean> {
   const alias = await vscode.window.showInputBox({
     title: vscode.l10n.t('Display alias — shown in the model picker'),
     value: profile.name,
@@ -327,7 +731,7 @@ async function duplicateModelFlow(
     ),
   });
   if (alias === undefined) {
-    return;
+    return false;
   }
   const entered = await vscode.window.showInputBox({
     title: vscode.l10n.t('API model ID'),
@@ -339,12 +743,12 @@ async function duplicateModelFlow(
     )} ${vscode.l10n.t('The base URL and API key are copied from "{0}".', profile.name || profile.model)}`,
   });
   if (entered === undefined) {
-    return;
+    return false;
   }
   const model = entered.trim();
   if (model.length === 0) {
     void vscode.window.showErrorMessage(vscode.l10n.t('A model ID is required.'));
-    return;
+    return false;
   }
   try {
     const key = newProfileKey();
@@ -369,11 +773,13 @@ async function duplicateModelFlow(
     void vscode.window.showInformationMessage(
       vscode.l10n.t('Duplicated model group: {0}', entrySummaryLine(clone))
     );
+    return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     void vscode.window.showErrorMessage(
       vscode.l10n.t('Duplicating the model failed: {0}', message)
     );
+    return false;
   }
 }
 
@@ -389,8 +795,12 @@ async function duplicateModelFlow(
  * Token limits re-detect from the new id unless the group carries explicit
  * ones (a gear choice made for the old model is still the user's explicit
  * choice, and is never silently reset).
+ *
+ * Returns whether the input was CONCLUDED (an ID entered — changed or
+ * confirmed unchanged), so the manager can end the visit instead of
+ * re-opening the list; Esc or an invalid entry falls back to it.
  */
-async function updateModelIdFlow(profile: Profile): Promise<void> {
+async function updateModelIdFlow(profile: Profile): Promise<boolean> {
   const entered = await vscode.window.showInputBox({
     title: vscode.l10n.t('API model ID'),
     value: profile.model,
@@ -400,18 +810,18 @@ async function updateModelIdFlow(profile: Profile): Promise<void> {
     )} ${vscode.l10n.t('The endpoint, alias and API key are kept.')}`,
   });
   if (entered === undefined) {
-    return;
+    return false;
   }
   const model = entered.trim();
   if (model.length === 0) {
     void vscode.window.showErrorMessage(vscode.l10n.t('A model ID is required.'));
-    return;
+    return false;
   }
   if (model === profile.model) {
     void vscode.window.showInformationMessage(
       vscode.l10n.t('"{0}" already uses this model ID — nothing changed.', profile.model)
     );
-    return;
+    return true; // Entered and concluded — nothing more to tend here.
   }
   const next: Profile = { ...profile, model };
   try {
@@ -430,11 +840,13 @@ async function updateModelIdFlow(profile: Profile): Promise<void> {
         entryLimitsLabel(next)
       )
     );
+    return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     void vscode.window.showErrorMessage(
       vscode.l10n.t('Updating the model failed: {0}', message)
     );
+    return false;
   }
 }
 
@@ -567,6 +979,22 @@ async function modelWizard(context: vscode.ExtensionContext): Promise<boolean> {
     return false;
   }
 
+  // Two rung steps: which windows and which effort positions this model may be
+  // used at, then which one it DECLARES. The window candidates are computed
+  // against the output ceiling the row is about to inherit, so the labels are
+  // the totals the context ring will show. Accepting both defaults reproduces
+  // the old single-window / all-positions row exactly.
+  const outputTokens =
+    detectModelPreset(model)?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  const window = await pickWindowTiers(model, outputTokens);
+  if (!window) {
+    return false;
+  }
+  const effort = await pickEffortTiers();
+  if (!effort) {
+    return false;
+  }
+
   const answer = await promptApiKey();
   if (!answer) {
     return false;
@@ -583,8 +1011,16 @@ async function modelWizard(context: vscode.ExtensionContext): Promise<boolean> {
       // Only a keyless endpoint carries the flag; a keyed one must never
       // inherit it, or a later "key removed" would read as "no auth needed".
       ...(apiKey ? {} : { noAuth: true }),
-      maxInputTokens: 0,
+      // The DECLARED window (0 = the preset chain decides) and the rungs it may
+      // be switched between; a single rung is the declaration restated, so only
+      // a real choice is stored.
+      maxInputTokens: window.declared,
       maxOutputTokens: 0,
+      ...(window.inputs.length > 1 ? { windowInputs: window.inputs } : {}),
+      // The effort positions this gateway accepts (empty = none) and the one a
+      // request uses before the panel is touched.
+      reasoningIds: effort.ids,
+      ...(effort.defaultId ? { defaultThinkingEffort: effort.defaultId } : {}),
     };
     if (apiKey) {
       await writeProfileApiKey(context, key, apiKey);
@@ -606,7 +1042,7 @@ async function modelWizard(context: vscode.ExtensionContext): Promise<boolean> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     void vscode.window.showErrorMessage(
-      vscode.l10n.t('Custom for Copilot Chat setup failed: {0}', message)
+      vscode.l10n.t('Custom for Copilot setup failed: {0}', message)
     );
     return false;
   }
