@@ -105,7 +105,7 @@ const {
 const { streamSseToProgress } = require('../out/stream.js');
 const { classifyRequestShape } = require('../out/requestKind.js');
 const { usageDataPart } = require('../out/stream.js');
-const { createPreflightToolCallId, filterPreflightControlFlow, inspectActivatePreflight } = require('../out/toolPreflight.js');
+const { createPreflightToolCallId, filterPreflightControlFlow, inspectActivatePreflight, pickActivatorToCall, preflightBudgetExhausted, rewriteDisabledToolResults } = require('../out/toolPreflight.js');
 
 // --- convertMessage: tool calls + tool results split into role:tool entries ---
 const toolCallMsg = {
@@ -249,6 +249,76 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
   const filtered = filterPreflightControlFlow(messages);
   assert.strictEqual(filtered.length, 1);
   assert.strictEqual(estimatePromptTokens(messages) > 0, true);
+
+  // --- preflight: the host's "disabled by the user" refusal ---
+  // Groups are mutually exclusive, so a tool from the group we did not arm is
+  // answered with a sentence that blames the user. Two things must happen:
+  // re-arm the group that serves the refused tool, and rewrite the sentence.
+  const refusal = (callId, toolName) => ({
+    role: 1,
+    content: [
+      new LanguageModelToolResultPart(callId, [
+        new LanguageModelTextPart(
+          `ERROR while calling tool: Tool ${toolName} is currently disabled by the user, and cannot be called. ` +
+            'Please check your input and try again.'
+        ),
+      ]),
+    ],
+  });
+  const activationTail = (round, activator) => {
+    const id = createPreflightToolCallId(round, activator);
+    return [
+      { role: 2, content: [new LanguageModelToolCallPart(id, activator, {})] },
+      { role: 1, content: [new LanguageModelToolResultPart(id, [new LanguageModelTextPart('Tools activated: read_file')])] },
+    ];
+  };
+  const switches = [{ name: 'activate_read' }, { name: 'activate_web' }, { name: 'read_file' }];
+  const refusedTurn = (activator, round, callId, toolName) => [
+    { role: 1, content: [new LanguageModelTextPart('do the thing')] },
+    ...activationTail(round, activator),
+    { role: 2, content: [new LanguageModelToolCallPart(callId, toolName, { q: 'x' })] },
+    refusal(callId, toolName),
+  ];
+  // The refused tool's OWN group is the one to bring back — re-arming what ran
+  // last cannot help, and that mismatch is what burned the round budget.
+  const crossGroup = inspectActivatePreflight(refusedTurn('activate_read', 1, 'call_web', 'web_search'), switches);
+  assert.strictEqual(crossGroup.refusedAfterActivation, true);
+  assert.deepStrictEqual(crossGroup.refusedToolNames, ['web_search']);
+  assert.strictEqual(pickActivatorToCall(crossGroup), 'activate_web');
+  // A switch whose name merely CONTAINS the group (`activate_gitlab` vs `git`)
+  // is the wrong group; fall back to the switch that ran last.
+  const substringOnly = inspectActivatePreflight(refusedTurn('activate_read', 1, 'call_git', 'git_status'), [
+    { name: 'activate_read' },
+    { name: 'activate_gitlab' },
+  ]);
+  assert.strictEqual(pickActivatorToCall(substringOnly), 'activate_read');
+  // Budget spent → emit NOTHING and send the request (degraded surface beats a
+  // failed turn: throwing here made every retry hit the same state).
+  const exhausted = inspectActivatePreflight(
+    [
+      { role: 1, content: [new LanguageModelTextPart('do the thing')] },
+      ...activationTail(1, 'activate_read'),
+      ...activationTail(2, 'activate_read'),
+      ...activationTail(3, 'activate_read'),
+      { role: 2, content: [new LanguageModelToolCallPart('call_web', 'web_search', { q: 'x' })] },
+      refusal('call_web', 'web_search'),
+    ],
+    switches
+  );
+  assert.strictEqual(exhausted.rounds, 3);
+  assert.strictEqual(exhausted.refusedAfterActivation, true);
+  assert.strictEqual(preflightBudgetExhausted(exhausted), true);
+  assert.strictEqual(pickActivatorToCall(exhausted), undefined, 'no fourth round, ever');
+  // The refusal is rewritten into something the model can act on.
+  const rewrittenTurn = rewriteDisabledToolResults(refusedTurn('activate_read', 1, 'call_web', 'web_search'));
+  const rewrittenText = rewrittenTurn[rewrittenTurn.length - 1].content[0].content[0].value;
+  assert.ok(rewrittenText.includes('activate_'), `must name the fix: ${rewrittenText}`);
+  assert.ok(!rewrittenText.includes('disabled by the user'), 'the misleading sentence is gone');
+  assert.ok(rewrittenText.includes('web_search'), 'the refused tool is still named');
+  // A doc/skill that merely QUOTES the sentence is not the host talking.
+  const quote = [{ role: 1, content: [new LanguageModelTextPart('Returned: Tool git_status is currently disabled by the user.')] }];
+  assert.strictEqual(rewriteDisabledToolResults(quote), quote, 'same array reference when nothing matched');
+  assert.strictEqual(rewriteDisabledToolResults(filtered), filtered, 'happy path rebuilds nothing');
   // --- thinking effort: gear resolution + what lands on the wire ---
   const entry = { id: 'm1', name: 'm1', maxInputTokens: 128000, maxOutputTokens: 16384 };
   // The four positions ARE the words the Copilot harness can label (its own
@@ -732,13 +802,13 @@ streamSseToProgress(sseResponse(events).body, { report: (p) => reported.push(p) 
   const prunedAllow = pruneAllowList(allow, 'CustomforCopilot.custom-for-copilot');
   assert.deepStrictEqual(
     prunedAllow.removed.sort(),
-    ['CustomforCopilot.custom-for-copilot-chat', 'customforcopilot.custom-for-copilot'],
-    'previous ids of this extension are removed, case-insensitively'
+    ['CustomforCopilot.custom-for-copilot-chat'],
+    'the OTHER id of this extension is removed, whatever the case of its publisher'
   );
   assert.deepStrictEqual(
     Object.keys(prunedAllow.next).sort(),
-    ['CustomforCopilot.custom-for-copilot', 'someone.else-entirely'],
-    'the current id and other extensions survive'
+    ['CustomforCopilot.custom-for-copilot', 'customforcopilot.custom-for-copilot', 'someone.else-entirely'],
+    'the current id (and its case variants) and other extensions survive'
   );
 
   const groups = [

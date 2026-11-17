@@ -31,6 +31,13 @@
  *   - `activate_*` entries never disappear from an expanded list, so their
  *     continued presence is the normal state, NOT an instability signal.
  *
+ * The same exclusivity has a mid-turn consequence: a tool from a group we did
+ * not arm is answered with "Tool X is currently disabled by the user" — a
+ * sentence that blames the user, while the real fix is an `activate_*` call.
+ * So a refusal that lands AFTER our last activation re-arms the group serving
+ * the refused tool, and every refusal is rewritten into that actionable form
+ * before the request leaves the provider (see rewriteDisabledToolResults).
+ *
  * The synthetic call ids are recognisable (`cm_preflight_activate_<round>_…`)
  * so we can tell our own control flow apart from VS Code's.
  *
@@ -46,6 +53,23 @@ export const ACTIVATE_TOOL_PREFIX = 'activate_';
 
 /** Marks a call/result part as OUR synthetic activation handshake. */
 const PREFLIGHT_CALL_ID_PREFIX = 'cm_preflight_activate_';
+
+/**
+ * The host's refusal when the refusing tool's group is not the live one.
+ * Anchored on the tool name so the rewrite can name the tool back to the
+ * model. The host's trailing clause ("and cannot be called. Please check your
+ * input and try again.") is matched whole — replacing only the first sentence
+ * would leave that one dangling after the new advice.
+ */
+const HOST_REFUSAL_PATTERN =
+  /Tool ([\w.]+) is currently disabled by the user(?:[^.]*\.)?(?:\s*Please[^.]*\.)?/g;
+
+/**
+ * Every failed tool invocation's result is prefixed with this by the host.
+ * Requiring it keeps quoted documentation ("... `Tool X is currently disabled
+ * by the user` ...") from being mistaken for a refusal.
+ */
+const HOST_TOOL_ERROR_PREFIX = 'ERROR while calling tool:';
 const CALL_ID_SEPARATOR = '_';
 const TOOL_NAME_HASH_LENGTH = 32;
 
@@ -73,6 +97,18 @@ export interface ActivatePreflight {
    * reported for diagnostics and never retried.
    */
   activatorsStillAdvertised: boolean;
+  /**
+   * Tools the host refused with "currently disabled by the user" since the
+   * last human message (empty = no refusal in this turn).
+   */
+  refusedToolNames: string[];
+  /**
+   * A refusal landed AFTER our last activation — the live group was revoked
+   * (another group took over, or the activation expired with the round), so
+   * the handshake has to re-arm the switch serving that tool's group. A
+   * refusal that sits BEFORE the activation is old news and must not re-arm.
+   */
+  refusedAfterActivation: boolean;
 }
 
 /**
@@ -86,19 +122,52 @@ export function inspectActivatePreflight(
   tools: readonly vscode.LanguageModelChatTool[] | undefined
 ): ActivatePreflight {
   const activatorNames = collectActivateToolNames(tools);
+  // callId → tool name: a refusal only counts for the call it answers (see
+  // refusalToolNames). Built over the WHOLE transcript because the call we are
+  // looking for may sit anywhere before its result.
+  const toolNameByCallId = collectToolCallNames(messages);
   const calledActivatorNames = new Set<string>();
   let rounds = 0;
+  // Transcript order decides whether a refusal is old news or a live problem:
+  // both counters advance per part, so comparing them needs no timestamps.
+  let order = 0;
+  let lastActivationOrder = -1;
+  let lastRefusalOrder = -1;
+  let refusedToolNames: string[] = [];
 
   const latestUserIndex = findLatestHumanUserMessageIndex(messages);
   for (let index = latestUserIndex + 1; index < messages.length; index += 1) {
     for (const part of messages[index].content) {
+      order += 1;
       const parsed = parsePreflightPart(part);
-      if (!parsed) {
+      if (parsed) {
+        rounds = Math.max(rounds, parsed.round);
+        if (parsed.toolName?.startsWith(ACTIVATE_TOOL_PREFIX)) {
+          calledActivatorNames.add(parsed.toolName);
+          lastActivationOrder = order;
+        }
         continue;
       }
-      rounds = Math.max(rounds, parsed.round);
-      if (parsed.toolName?.startsWith(ACTIVATE_TOOL_PREFIX)) {
-        calledActivatorNames.add(parsed.toolName);
+      const activationName = activationCallName(part);
+      if (activationName) {
+        // The model's own activator call carries a host-generated id, so it
+        // never parses above — but it still means "we activated here", which
+        // is what a later refusal has to be compared against. It also counts
+        // as called: otherwise the next round would pick the SAME group again
+        // and revoke the one the model just brought in.
+        calledActivatorNames.add(activationName);
+        lastActivationOrder = order;
+        continue;
+      }
+      const refused = refusalToolNames(
+        part,
+        part instanceof vscode.LanguageModelToolResultPart
+          ? toolNameByCallId.get(part.callId)
+          : undefined
+      );
+      if (refused.length > 0) {
+        refusedToolNames = refused;
+        lastRefusalOrder = order;
       }
     }
   }
@@ -113,6 +182,8 @@ export function inspectActivatePreflight(
     // sit there waiting. See the header note on exclusive groups.
     activatorsStillAdvertised:
       rounds > 0 && activatorNames.length > 0 && Boolean(tools?.length),
+    refusedToolNames,
+    refusedAfterActivation: lastRefusalOrder > lastActivationOrder,
   };
 }
 
@@ -120,13 +191,78 @@ export function inspectActivatePreflight(
  * Which activator to call next — `undefined` once the handshake is done.
  *
  * Exactly ONE per turn, by design: groups are mutually exclusive on the host,
- * so a second call would revoke the group the first one just brought in.
+ * so a second call would revoke the group the first one just brought in. The
+ * choice is made here (deterministic, first advertised) rather than left to the
+ * host's execution order, so the resulting capability set is predictable and
+ * can be logged.
+ *
+ * Two exceptions, both bounded by MAX_PREFLIGHT_ROUNDS:
+ *
+ *   - a refusal that landed AFTER our activation means the live group was
+ *     revoked, so a switch has to be brought back. The switch to bring back is
+ *     the one serving the REFUSED tool's capability group — re-arming whatever
+ *     ran last cannot help when the refused tool belongs to another group, and
+ *     that mismatch turns a one-round recovery into a ping-pong that burns the
+ *     whole budget;
+ *   - if no advertised activator names that group (the host is free to name
+ *     switches differently), fall back to the last armed switch — but only
+ *     while the host still advertises it. Calling one that is gone answers
+ *     `The tool "..." does not exist` and cannot change anything.
+ *
+ * The budget check lives here as well as in the caller: this is the function
+ * that could loop, so it must be unable to.
  */
 export function pickActivatorToCall(preflight: ActivatePreflight): string | undefined {
-  if (preflight.calledActivatorNames.length > 0) {
+  if (preflightBudgetExhausted(preflight)) {
     return undefined;
   }
-  return preflight.remainingActivatorNames[0];
+  if (preflight.calledActivatorNames.length === 0) {
+    return preflight.remainingActivatorNames[0];
+  }
+  if (!preflight.refusedAfterActivation) {
+    return undefined;
+  }
+  return reArmActivatorFor(preflight);
+}
+
+/** True once this turn has spent its activation rounds — emit nothing more. */
+export function preflightBudgetExhausted(preflight: ActivatePreflight): boolean {
+  return preflight.rounds >= MAX_PREFLIGHT_ROUNDS;
+}
+
+/** The switch to bring back after a refusal that followed our last activation. */
+function reArmActivatorFor(preflight: ActivatePreflight): string | undefined {
+  const refused = preflight.refusedToolNames[preflight.refusedToolNames.length - 1];
+  if (refused !== undefined) {
+    const group = capabilityGroupOf(refused);
+    const serving = preflight.activatorNames.find((name) => activatorServesGroup(name, group));
+    if (serving !== undefined) {
+      return serving;
+    }
+  }
+  const lastCalled = preflight.calledActivatorNames[preflight.calledActivatorNames.length - 1];
+  return preflight.activatorNames.includes(lastCalled) ? lastCalled : undefined;
+}
+
+/**
+ * Does this switch advertise a tool of `group`? Token match on the switch name:
+ * `activate_gitlab` and `activate_fallback_gitlab_compare_1` both serve
+ * `gitlab`, while `activate_gitlab` does NOT serve `git` — a substring match
+ * would pick the wrong group, and the wrong group is what the re-arm exists to
+ * avoid.
+ */
+function activatorServesGroup(activatorName: string, group: string): boolean {
+  const needle = group.toLowerCase();
+  return activatorName
+    .slice(ACTIVATE_TOOL_PREFIX.length)
+    .split(CALL_ID_SEPARATOR)
+    .some((token) => token.toLowerCase() === needle);
+}
+
+/** Capability bucket for one real tool name (`read_file` → `read`). */
+function capabilityGroupOf(name: string): string {
+  const separator = name.indexOf('_');
+  return separator > 0 ? name.slice(0, separator) : name;
 }
 
 /** Real (non-activator) tools currently on the surface. */
@@ -154,8 +290,7 @@ export function summarizeToolSurface(
       activators += 1;
       continue;
     }
-    const separator = tool.name.indexOf('_');
-    const group = separator > 0 ? tool.name.slice(0, separator) : tool.name;
+    const group = capabilityGroupOf(tool.name);
     counts.set(group, (counts.get(group) ?? 0) + 1);
   }
   const groups = [...counts.entries()]
@@ -197,6 +332,132 @@ export function filterPreflightControlFlow(
   }
 
   return changed ? filtered : messages;
+}
+
+/**
+ * Rewrite the host's refusal into an actionable one before the request leaves
+ * the provider.
+ *
+ * The host text blames the user ("disabled by the user") and ends in "Please
+ * check your input and try again", which reads as a dead end: the model has no
+ * way to learn that the fix is an `activate_*` call. Same identity contract as
+ * `filterPreflightControlFlow` — the SAME array reference comes back when
+ * nothing matched, so callers can skip rebuilding the payload.
+ */
+export function rewriteDisabledToolResults(
+  messages: readonly vscode.LanguageModelChatRequestMessage[]
+): readonly vscode.LanguageModelChatRequestMessage[] {
+  let changed = false;
+  const rewritten: vscode.LanguageModelChatRequestMessage[] = [];
+  const toolNameByCallId = collectToolCallNames(messages);
+
+  for (const message of messages) {
+    let touched = false;
+    const content = message.content.map((part) => {
+      const replacement = rewrittenRefusalPart(
+        part,
+        part instanceof vscode.LanguageModelToolResultPart
+          ? toolNameByCallId.get(part.callId)
+          : undefined
+      );
+      if (!replacement) {
+        return part;
+      }
+      touched = true;
+      return replacement;
+    });
+    if (!touched) {
+      rewritten.push(message);
+      continue;
+    }
+    changed = true;
+    rewritten.push({ ...message, content });
+  }
+
+  return changed ? rewritten : messages;
+}
+
+/** The refusal part with an actionable sentence, or `undefined` when it is not one. */
+function rewrittenRefusalPart(
+  part: unknown,
+  callName: string | undefined
+): vscode.LanguageModelToolResultPart | undefined {
+  if (!(part instanceof vscode.LanguageModelToolResultPart)) {
+    return undefined;
+  }
+  let touched = false;
+  const content = part.content.map((inner) => {
+    if (!(inner instanceof vscode.LanguageModelTextPart) || !isHostToolError(inner.value)) {
+      return inner;
+    }
+    const value = inner.value.replace(HOST_REFUSAL_PATTERN, (match, toolName: string) =>
+      // A result can quote the sentence (docs, skills, a grep hit). Only the
+      // refused call's own result is the host talking.
+      callName !== undefined && toolName !== callName ? match : refusalGuidance(toolName)
+    );
+    if (value === inner.value) {
+      return inner;
+    }
+    touched = true;
+    return new vscode.LanguageModelTextPart(value);
+  });
+  return touched ? new vscode.LanguageModelToolResultPart(part.callId, content) : undefined;
+}
+
+/** Every tool name the refusal in `part` mentions (empty when it is not one). */
+function refusalToolNames(part: unknown, callName: string | undefined): string[] {
+  if (!(part instanceof vscode.LanguageModelToolResultPart)) {
+    return [];
+  }
+  const names: string[] = [];
+  for (const inner of part.content) {
+    if (!(inner instanceof vscode.LanguageModelTextPart) || !isHostToolError(inner.value)) {
+      continue;
+    }
+    for (const match of inner.value.matchAll(HOST_REFUSAL_PATTERN)) {
+      if (callName !== undefined && match[1] !== callName) {
+        continue;
+      }
+      names.push(match[1]);
+    }
+  }
+  return names;
+}
+
+/** A tool result the host itself marked as a failed invocation. */
+function isHostToolError(value: string): boolean {
+  return value.includes(HOST_TOOL_ERROR_PREFIX);
+}
+
+function refusalGuidance(toolName: string): string {
+  return (
+    `Tool ${toolName} is not available right now: another tool-activation group is live, ` +
+    `so ${toolName} is not on the surface (the user disabled nothing). ` +
+    `Call the \`${ACTIVATE_TOOL_PREFIX}*\` tool that advertises ${toolName}, then retry the same call.`
+  );
+}
+
+/** The activator name of a (host-id) activation call, or `undefined`. */
+function activationCallName(part: unknown): string | undefined {
+  if (!(part instanceof vscode.LanguageModelToolCallPart)) {
+    return undefined;
+  }
+  return part.name.startsWith(ACTIVATE_TOOL_PREFIX) ? part.name : undefined;
+}
+
+/** callId → tool name for every tool call in the transcript. */
+function collectToolCallNames(
+  messages: readonly vscode.LanguageModelChatRequestMessage[]
+): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const message of messages) {
+    for (const part of message.content) {
+      if (part instanceof vscode.LanguageModelToolCallPart) {
+        names.set(part.callId, part.name);
+      }
+    }
+  }
+  return names;
 }
 
 /**

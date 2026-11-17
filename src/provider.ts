@@ -76,8 +76,9 @@ import {
   createPreflightToolCallId,
   filterPreflightControlFlow,
   inspectActivatePreflight,
-  MAX_PREFLIGHT_ROUNDS,
   pickActivatorToCall,
+  preflightBudgetExhausted,
+  rewriteDisabledToolResults,
   summarizeToolSurface,
 } from './toolPreflight';
 import {
@@ -1036,30 +1037,32 @@ function runToolPreflight(
 ): readonly vscode.LanguageModelChatRequestMessage[] | undefined {
   const preflight = inspectActivatePreflight(messages, options.tools);
   const activator = pickActivatorToCall(preflight);
+  if (!activator && preflightBudgetExhausted(preflight) && preflight.refusedAfterActivation) {
+    // The budget is spent while a re-arm was still owed. A list that never
+    // expands must not ping-pong forever (each round is a full-price request)
+    // — but it must not kill the turn either: the user asked for an answer,
+    // and a degraded tool surface beats "request failed". Throwing here is what
+    // made every retry hit the same state; the refusal rewrite below still
+    // names the next step, so the model can activate on its own.
+    logStage(
+      rid,
+      'preflight.giveup',
+      startedAt,
+      `kind=${requestKind} tool activation still incomplete after ${preflight.rounds} rounds` +
+        ` surface=${summarizeToolSurface(options.tools)} refused=${preflight.refusedToolNames.join('|') || 'none'}`
+    );
+  }
   if (activator) {
-    if (preflight.rounds >= MAX_PREFLIGHT_ROUNDS) {
-      // A list that never expands would ping-pong forever, each round a
-      // full-price request. Stop instead of looping.
-      logStage(
-        rid,
-        'preflight.abort',
-        startedAt,
-        `kind=${requestKind} tool activation still incomplete after ${preflight.rounds} rounds`
-      );
-      throw new vscode.LanguageModelError(
-        vscode.l10n.t(
-          'Custom for Copilot: tool activation did not complete after {0} rounds.',
-          String(MAX_PREFLIGHT_ROUNDS)
-        )
-      );
-    }
     const nextRound = preflight.rounds + 1;
     logStage(
       rid,
-      'preflight.activate',
+      // A re-arm is not a fresh handshake: the group has to be brought back
+      // because the host revoked it mid-turn. Distinguishing the two in the
+      // log is how a "tool suddenly disabled" report gets explained.
+      preflight.refusedAfterActivation ? 'preflight.rearm' : 'preflight.activate',
       startedAt,
       `kind=${requestKind} round=${nextRound} group=${activator} unused=${preflight.remainingActivatorNames.length - 1}` +
-        ` surface=${summarizeToolSurface(options.tools)}`
+        ` refused=${preflight.refusedToolNames.join('|') || 'none'} surface=${summarizeToolSurface(options.tools)}`
     );
     // ONE activator only: groups are mutually exclusive on the host, so more
     // calls would revoke the group this one brings in (see toolPreflight.ts).
@@ -1079,17 +1082,26 @@ function runToolPreflight(
   // group is actually live.
   const surface = summarizeToolSurface(options.tools);
   const real = countRealTools(options.tools);
+  // A refusal that did not need a re-arm is history (it predates the live
+  // activation) but still worth one field: it explains why the model retried.
+  const refused =
+    preflight.refusedToolNames.length > 0
+      ? ` refused=${preflight.refusedToolNames.join('|')}`
+      : '';
   if (real === 0 && preflight.activatorNames.length > 0) {
-    logStage(rid, 'preflight.drift', startedAt, `kind=${requestKind} no tool expanded ${surface}`);
+    logStage(rid, 'preflight.drift', startedAt, `kind=${requestKind} no tool expanded ${surface}${refused}`);
   } else {
     logStage(
       rid,
       'preflight.ready',
       startedAt,
-      `kind=${requestKind} ${surface} activated=${preflight.calledActivatorNames.join('|') || 'none'}`
+      `kind=${requestKind} ${surface} activated=${preflight.calledActivatorNames.join('|') || 'none'}${refused}`
     );
   }
-  return filterPreflightControlFlow(messages);
+  // The refusal rewrite must not cost a round trip on the happy path: it walks
+  // the transcript looking for one sentence and returns the same array when it
+  // is not there (see toolPreflight.ts).
+  return rewriteDisabledToolResults(filterPreflightControlFlow(messages));
 }
 
 function messageTextLength(message: vscode.LanguageModelChatRequestMessage): number {

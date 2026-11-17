@@ -1,5 +1,4 @@
 {
-  "Custom for Copilot: tool activation did not complete after {0} rounds.": "Custom for Copilot：工具激活在 {0} 轮后仍未完成。",
   "Dropped an incomplete tool call from the gateway: {0}. Retry, or pick another model — the gateway is truncating tool arguments.": "已丢弃网关返回的不完整工具调用：{0}。请重试，或换一个模型 —— 网关正在截断工具参数。",
   "Re-synced to Copilot — no model configured yet, so only the Agents-window allow-list was cleaned ({0} key(s)).": "已重新同步到 Copilot —— 尚未配置模型，仅清理了 Agents 窗口白名单（{0} 个键）。",
   "Re-synced to Copilot — {0} model(s) announced, {1} stale allow-list key(s) and {2} stale model-setting entry(ies) removed.": "已重新同步到 Copilot —— 已通告 {0} 个模型，清理了 {1} 个失效白名单键与 {2} 条失效的模型设置。",

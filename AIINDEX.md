@@ -50,7 +50,7 @@
 | `harnessSync.ts` | 234 | 命令「重新同步到 Copilot」：重发 provider 变更 → 修 `chat.*` 槽位 → 清掉上几个扩展 id 的白名单键 → 清掉 `chatLanguageModels.json` 里无法解析的 per-model 设置（宿主文件，只在显式命令里写，临时文件 + rename） | `syncToCopilot` `pruneAllowList` `pruneModelSettings` |
 | `replay.ts` | 162 | 思考回放标记（宿主不透明 data part）的写与读 | `REPLAY_MARKER_MIME` `createReasoningMarker` `readReasoningMarker` |
 | `requestKind.ts` | 215 | 「谁在问？」分类 + 辅助请求降级策略 | `classifyProviderRequest` `classifyRequestShape` `utilityDowngrade` `isUtilityKind` |
-| `toolPreflight.ts` | 291 | `activate_*` 工具激活握手（零 token 往返）+ 合成控制流清理 | `inspectActivatePreflight` `pickActivatorToCall` `filterPreflightControlFlow` `createPreflightToolCallId` `summarizeToolSurface` `countRealTools` `MAX_PREFLIGHT_ROUNDS` |
+| `toolPreflight.ts` | 552 | `activate_*` 工具激活握手（零 token 往返）+ 合成控制流清理 + **拒绝改写**（宿主那句 `is currently disabled by the user` → 点名可执行的 `activate_*`） | `inspectActivatePreflight` `pickActivatorToCall` `preflightBudgetExhausted` `filterPreflightControlFlow` `rewriteDisabledToolResults` `createPreflightToolCallId` `summarizeToolSurface` `countRealTools` `MAX_PREFLIGHT_ROUNDS` |
 | `hostDefaults.ts` | 175 | 把 `chat.defaultModel` / 两个 utility 槽位 / `byokUtilityModelDefault` 指向本插件（fill-only + stale 自愈，无强制覆盖路径） | `defaultChatUtilitySettingsToOwnModel` |
 | `agentWindow.ts` | 152 | Agents 窗口三个兼容开关，一次性写入 | `applyAgentWindowDefaults` `applyAgentWindowDefaultsOnce` |
 | `agentWindowTools.ts` | 234 | Agents 窗口工具可见性开关（关 tool search + 通配 capability）及其撤销 | `readAgentWindowToolState` `applyFullToolVisibility` `restoreAgentWindowToolDefaults` `showAgentWindowToolsMenu` |
@@ -72,7 +72,7 @@ VS Code / Copilot Chat
        2. readProfileApiKey(profile) → 无 key 抛 NoPermissions
        3. resolveProfileEntry → 限额（显式 > 预设 > 默认 1M/128K）
        4. classifyProviderRequest → RequestKind（辅助请求降级用）
-       5. runToolPreflight → 需要激活则只 report 一个 activate_* 调用并 return（不发请求）
+       5. runToolPreflight → 需要激活则只 report 一个 activate_* 调用并 return（不发请求）；否则把拒绝句改写成可执行提示后发请求
        6. readModelLimitOverrides → 面板改数：本请求生效 + 持久化进该组
        7. resolveThinkingEffort（默认 auto）+ 已学到的降级（learnedEffortFor）+ buildRequestBody（映射消息、工具、reasoning_effort）
        8. fetch POST {baseURL}/chat/completions   （有 Key 才带 Bearer，无鉴权端点不带 Authorization，SSE）
@@ -100,7 +100,7 @@ VS Code / Copilot Chat
 13. 限额覆写三态：`undefined` = 本次没动 · `>0` = 自定义（并持久化进模型组） · `<=0`（`Number('')===0`）= 清空，恢复自动。这三个值只在「宿主把原始字段名下发」时出现；**窗口/思考档位不走这条路**，它们是模型组自己的字段（`windowInputs` / `reasoningIds`，见第 26 条），由向导与管理菜单写入。
 14. 思考档位**四个位置就是宿主能标注的那四个词**：`none` / `low` / `medium` / `high`。一个模型组可以只声明其中**一个子集**（`Profile.reasoningIds`，空数组 = 完全不提供控件）；`none` **不发送任何思考参数**；其余原样发 `reasoning_effort`，默认 `high`。未知值、以及**该组没声明过的位置**都回落到该组自己的默认；退役 id `auto` 也映射到 `none`（老存储值不失效）。辅助请求（utility 降级命中）一律不带该参数。`reasoning_effort` 已在 `OPTIONAL_BODY_PARAMS` 里，被网关拒绝时 400 阶梯会自动摘掉。**id 不能随便命名**：Copilot 侧用固定表（`none/minimal/low/medium/high/xhigh/max`）逐项生成标签，表外的值被**直接丢弃** —— 曾用 `auto` 导致同一模型在一侧 5 档、另一侧 4 档。
 15. 辅助请求降级恒定生效：文本类 helper 去 `tools` + `max_tokens=2048`；`todo-tracker` / `prompt-categorizer` 保留唯一工具；`main-agent` / `terminal-steering` 绝不降级。
-16. preflight 每轮**只发一个** activator（宿主的分组互斥），最多 3 轮；合成 call id 前缀 `cm_preflight_activate_`，发真实请求前会被 `filterPreflightControlFlow` 摘掉。
+16. preflight 每轮**只发一个** activator（宿主的分组互斥），最多 3 轮（`MAX_PREFLIGHT_ROUNDS`；预算判据在 `pickActivatorToCall` 第一行，函数本身不可能循环）；合成 call id 前缀 `cm_preflight_activate_`，发真实请求前会被 `filterPreflightControlFlow` 摘掉。**激活成功后仍可能被拒**：宿主回 `Tool X is currently disabled by the user`（其实是别的组接管/激活随轮次失效，用户什么都没做）——若该拒绝晚于我们上一次激活，就 re-arm **被拒工具所属组**的激活器（开关名 token 精确匹配，`git` 不匹配 `activate_gitlab`；匹配不到才回落到上次那一个且仅当它仍被广告）；并把这句改写成可执行的下一步（`rewriteDisabledToolResults`）。**轮次预算耗尽时只降级放行**（`preflight.giveup`，工具面可能不全但对话继续），**永不抛错**——抛错会让重试永久命中同一状态。日志：`preflight.activate|rearm|giveup|drift|ready`。
 17. `l10n.t()` 的参数必须是**字符串字面量**；清单文案走 `%key%`，en/zh 两份都要有（缺键不会回退，会原样显示 `%key%`）。
 18. 诊断日志（`fs.appendFileSync`）全部包在 try/catch 内 —— 日志失败绝不能让请求失败。
 19. **`customModel.modelList` 是镜像，不是输入**：只写不读，`onProfilesChanged` 触发重绘；手改会在下次变更时被覆盖。镜像里**不得出现端点与密钥**（凭据存储的全部意义就是不落盘这两样），`scope: machine` 保证设置同步不带走它。
